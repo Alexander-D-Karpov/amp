@@ -1,0 +1,94 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+    branches:
+      - master
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+      - name: Install Fyne
+        run: go install fyne.io/fyne/v2/cmd/fyne@latest
+      - name: Run tests
+        run: go test -v ./...
+      - name: Run linting
+        uses: golangci/golangci-lint-action@v3
+        with:
+          version: latest
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/master'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - name: Install fyne and fyne-cross
+        run: |
+          go install fyne.io/fyne/v2/cmd/fyne@latest
+          go install github.com/fyne-io/fyne-cross@latest
+
+      - name: Create placeholder icon
+        run: |
+          mkdir -p assets
+          # Create a simple placeholder icon if none exists
+          if [ ! -f assets/icon.png ]; then
+            echo "Creating placeholder icon"
+            # You should replace this with an actual icon creation
+            touch assets/icon.png
+          fi
+
+      - name: Build for Windows
+        run: cd cmd/desktop && fyne-cross windows -arch amd64 -output ../../dist/
+
+      - name: Build for macOS
+        run: cd cmd/desktop && fyne-cross darwin -arch amd64 -output ../../dist/
+
+      - name: Build for Linux
+        run: cd cmd/desktop && fyne-cross linux -arch amd64 -output ../../dist/
+
+      - name: Build for Android
+        run: cd cmd/mobile && fyne-cross android -arch arm64 -output ../../dist/
+
+      - name: Create Tag
+        id: create_tag
+        run: |
+          TAG_NAME="v-$(echo ${{ github.sha }} | cut -c1-7)"
+          echo "tag_name=$TAG_NAME" >> $GITHUB_OUTPUT
+          git tag $TAG_NAME
+          git push origin $TAG_NAME
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.create_tag.outputs.tag_name }}
+          name: AMP Release ${{ steps.create_tag.outputs.tag_name }}
+          draft: false
+          prerelease: true
+          files: |
+            dist/windows-amd64/amp.exe
+            dist/darwin-amd64/amp.app.tar.xz
+            dist/linux-amd64/amp.tar.xz
+            dist/android-arm64/amp.apk
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -1,0 +1,15 @@
+Website = "https://github.com/Alexander-D-Karpov/amp"
+
+[Details]
+Icon = "assets/icon.png"
+Name = "A(dvanced)karpov Music Player"
+ID = "ru.akarpov.amp"
+Version = "1.0.0"
+Build = 1
+
+[LinuxAndBSD]
+GenericName = "AMP"
+Categories = ["AudioVideo", "Audio", "Player"]
+Comment = "Advanced music player for Akarpov music platform"
+Keywords = ["music", "player", "audio", "akarpov", "streaming"]
+ExecParams = ""

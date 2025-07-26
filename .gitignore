@@ -1,0 +1,119 @@
+*.sqlite
+
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool, specifically when used with LiteIDE
+*.out
+
+# Dependency directories (remove the comment below to include it)
+# vendor/
+
+# Go workspace file
+go.work
+
+# Build artifacts
+/bin/
+/dist/
+/build/
+/fyne-cross/
+
+# Application data
+/data/
+/cache/
+/logs/
+*.db
+*.db-shm
+*.db-wal
+
+# Configuration files with secrets
+config.yaml
+config.yml
+.env
+.env.local
+.env.*.local
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Temporary files
+*.tmp
+*.temp
+/tmp/
+
+# Fyne specific
+*.syso
+resource.go
+bundled.go
+
+# Mobile build artifacts
+*.apk
+*.aab
+*.ipa
+
+# Desktop package artifacts
+*.deb
+*.rpm
+*.dmg
+*.msi
+*.app/
+*.tar.gz
+*.tar.xz
+*.zip
+
+# Coverage reports
+coverage.out
+coverage.html
+
+# Profiling data
+*.prof
+
+# Local development
+/dev/
+/playground/
+/experiments/
+
+# Audio files
+*.mp3
+*.wav
+*.flac
+*.ogg
+*.m4a
+
+# Images
+*.jpg
+*.jpeg
+*.png
+*.gif
+*.bmp
+*.webp
+
+# Documents
+*.pdf
+*.doc
+*.docx
+
+# Backup files
+*.bak
+*.backup
+*.old

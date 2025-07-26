@@ -1,0 +1,102 @@
+# AMP Configuration Example
+# Copy this file to config.yaml and modify as needed
+
+# Enable debug logging
+debug: false
+
+# API Configuration
+api:
+  # Base URL for the akarpov music API
+  base_url: "https://new.akarpov.ru/api/v1"
+
+  # Your API token from https://new.akarpov.ru/settings/api
+  # Leave empty to use offline mode only
+  token: ""
+
+  # Rate limiting to prevent overwhelming the API
+  rate_limit:
+    requests_per_second: 100
+    burst_size: 10
+
+  # Request timeout in seconds
+  timeout: 30
+
+  # Number of retry attempts for failed requests
+  retries: 3
+
+  # User agent string for API requests
+  user_agent: "AMP/1.0.0"
+
+# Storage Configuration
+storage:
+  # Path to SQLite database file
+  database_path: "./data/music.db"
+
+  # Directory for cached files (audio, images, etc.)
+  cache_dir: "./cache"
+
+  # Maximum cache size in bytes (1GB = 1073741824)
+  max_cache_size: 1073741824
+
+  # Sync interval in seconds (300 = 5 minutes)
+  sync_interval: 300
+
+  # Enable WAL mode for better SQLite performance
+  enable_wal: true
+
+# Audio Configuration
+audio:
+  # Audio sample rate (44100 is CD quality)
+  sample_rate: 44100
+
+  # Audio buffer size (larger = less CPU, more latency)
+  buffer_size: 8192
+
+  # Default volume (0.0 to 1.0)
+  default_volume: 0.7
+
+  # Enable crossfade between tracks
+  crossfade: false
+
+# User Interface Configuration
+ui:
+  # Theme: "dark" or "light"
+  theme: "dark"
+
+  # Default window dimensions
+  window_width: 1200
+  window_height: 800
+
+  # Language code (en, es, fr, de, ru)
+  language: "en"
+
+  # Number of columns in grid views
+  grid_columns: 4
+
+# Search Configuration
+search:
+  # Maximum number of search results
+  max_results: 100
+
+  # Fuzzy search threshold (0.0 to 1.0, higher = more strict)
+  fuzzy_threshold: 0.6
+
+  # Enable search while typing
+  enable_typing: true
+
+  # Debounce delay in milliseconds
+  debounce_ms: 300
+
+# Download Configuration
+download:
+  # Maximum concurrent downloads
+  max_concurrent: 3
+
+  # Download chunk size in bytes (1MB = 1048576)
+  chunk_size: 1048576
+
+  # Temporary directory for downloads
+  temp_dir: "./cache/temp"
+
+  # Automatically download songs when played
+  auto_download: false
