@@ -77,7 +77,7 @@ func (c *Client) debugLog(format string, args ...interface{}) {
 	log.Printf("[API] "+format, args...)
 }
 
-func (c *Client) debugRequest(method, url string, body interface{}, startTime time.Time) {
+func (c *Client) debugRequest(method, url string, body interface{}) {
 	if !c.debug {
 		return
 	}
@@ -104,55 +104,21 @@ func (c *Client) debugRequest(method, url string, body interface{}, startTime ti
 		c.requestCount, authType, method, url, bodyStr)
 }
 
-func (c *Client) debugResponse(method, url string, statusCode int, responseBody []byte, duration time.Duration, err error) {
+func (c *Client) debugResponse(method, url string, statusCode int, duration time.Duration, err error) {
 	if !c.debug {
 		return
 	}
 
-	status := "SUCCESS"
 	if err != nil {
-		status = "ERROR"
 		c.errorCount++
+		log.Printf("[API] ERROR %s %s - Status: %d - Duration: %v - Error: %v",
+			method, url, statusCode, duration, err)
 	}
 
-	var respStr string
-	if len(responseBody) > 0 {
-		respStr = string(responseBody)
-		if len(respStr) > 300 {
-			respStr = respStr[:300] + "..."
-		}
+	if c.requestCount%50 == 0 {
+		log.Printf("[API] STATS - Total Requests: %d, Errors: %d, Error Rate: %.2f%%",
+			c.requestCount, c.errorCount, float64(c.errorCount)/float64(max(c.requestCount, 1))*100)
 	}
-
-	c.debugLog("RESPONSE [%s] %s %s - Status: %d - Duration: %v - Error: %v - Body: %s",
-		status, method, url, statusCode, duration, err, respStr)
-
-	if c.requestCount%10 == 0 {
-		c.debugLog("STATS - Total Requests: %d, Errors: %d, Error Rate: %.2f%%",
-			c.requestCount, c.errorCount, float64(c.errorCount)/float64(c.requestCount)*100)
-	}
-}
-
-func extractPageFromURL(urlStr string) int {
-	if urlStr == "" {
-		return 0
-	}
-
-	u, err := url.Parse(urlStr)
-	if err != nil {
-		return 0
-	}
-
-	pageStr := u.Query().Get("page")
-	if pageStr == "" {
-		return 0
-	}
-
-	page, err := strconv.Atoi(pageStr)
-	if err != nil {
-		return 0
-	}
-
-	return page
 }
 
 func (c *Client) makeRequest(ctx context.Context, method, path string, params url.Values, body interface{}) (*http.Response, []byte, error) {
@@ -163,17 +129,17 @@ func (c *Client) makeRequest(ctx context.Context, method, path string, params ur
 	}
 
 	fullURL := c.baseURL + path
-	if params != nil && len(params) > 0 {
+	if len(params) > 0 {
 		fullURL += "?" + params.Encode()
 	}
 
-	c.debugRequest(method, fullURL, body, startTime)
+	c.debugRequest(method, fullURL, body)
 
 	var reqBody io.Reader
 	if body != nil {
 		bodyBytes, err := json.Marshal(body)
 		if err != nil {
-			c.debugResponse(method, fullURL, 0, nil, time.Since(startTime), err)
+			c.debugResponse(method, fullURL, 0, time.Since(startTime), err)
 			return nil, nil, fmt.Errorf("marshal request body: %w", err)
 		}
 		reqBody = bytes.NewReader(bodyBytes)
@@ -181,7 +147,7 @@ func (c *Client) makeRequest(ctx context.Context, method, path string, params ur
 
 	req, err := retryablehttp.NewRequestWithContext(ctx, method, fullURL, reqBody)
 	if err != nil {
-		c.debugResponse(method, fullURL, 0, nil, time.Since(startTime), err)
+		c.debugResponse(method, fullURL, 0, time.Since(startTime), err)
 		return nil, nil, fmt.Errorf("create request: %w", err)
 	}
 
@@ -200,19 +166,21 @@ func (c *Client) makeRequest(ctx context.Context, method, path string, params ur
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		c.debugResponse(method, fullURL, 0, nil, time.Since(startTime), err)
+		c.debugResponse(method, fullURL, 0, time.Since(startTime), err)
 		return nil, nil, fmt.Errorf("do request: %w", err)
 	}
 
 	responseBody, readErr := io.ReadAll(resp.Body)
-	resp.Body.Close()
+	if closeErr := resp.Body.Close(); closeErr != nil {
+		c.debugLog("Failed to close response body: %v", closeErr)
+	}
 
 	if readErr != nil {
-		c.debugResponse(method, fullURL, resp.StatusCode, nil, time.Since(startTime), readErr)
+		c.debugResponse(method, fullURL, resp.StatusCode, time.Since(startTime), readErr)
 		return resp, nil, fmt.Errorf("read response body: %w", readErr)
 	}
 
-	c.debugResponse(method, fullURL, resp.StatusCode, responseBody, time.Since(startTime), nil)
+	c.debugResponse(method, fullURL, resp.StatusCode, time.Since(startTime), nil)
 
 	if resp.StatusCode >= 400 {
 		var apiError struct {
@@ -234,12 +202,12 @@ func (c *Client) makeRequest(ctx context.Context, method, path string, params ur
 			}
 
 			err := fmt.Errorf("API error %d: %s", resp.StatusCode, errorMsg)
-			c.debugResponse(method, fullURL, resp.StatusCode, responseBody, time.Since(startTime), err)
+			c.debugResponse(method, fullURL, resp.StatusCode, time.Since(startTime), err)
 			return resp, responseBody, err
 		}
 
 		err := fmt.Errorf("HTTP %d: %s", resp.StatusCode, resp.Status)
-		c.debugResponse(method, fullURL, resp.StatusCode, responseBody, time.Since(startTime), err)
+		c.debugResponse(method, fullURL, resp.StatusCode, time.Since(startTime), err)
 		return resp, responseBody, err
 	}
 
@@ -338,7 +306,7 @@ func (c *Client) GetSongs(ctx context.Context, page int, search string) (*types.
 func (c *Client) GetSong(ctx context.Context, slug string) (*types.Song, error) {
 	c.debugLog("Getting song: %s", slug)
 
-	_, responseBody, err := c.makeRequest(ctx, "GET", "/music/song/"+slug, nil, nil)
+	_, responseBody, err := c.makeRequest(ctx, "GET", "/music/song/"+slug+"/", nil, nil)
 	if err != nil {
 		return nil, fmt.Errorf("get song: %w", err)
 	}
@@ -380,7 +348,7 @@ func (c *Client) GetAlbums(ctx context.Context, page int, search string) (*types
 func (c *Client) GetAlbum(ctx context.Context, slug string) (*types.Album, error) {
 	c.debugLog("Getting album: %s", slug)
 
-	_, responseBody, err := c.makeRequest(ctx, "GET", "/music/albums/"+slug, nil, nil)
+	_, responseBody, err := c.makeRequest(ctx, "GET", "/music/albums/"+slug+"/", nil, nil)
 	if err != nil {
 		return nil, fmt.Errorf("get album: %w", err)
 	}
@@ -422,7 +390,7 @@ func (c *Client) GetAuthors(ctx context.Context, page int, search string) (*type
 func (c *Client) GetAuthor(ctx context.Context, slug string) (*types.Author, error) {
 	c.debugLog("Getting author: %s", slug)
 
-	_, responseBody, err := c.makeRequest(ctx, "GET", "/music/authors/"+slug, nil, nil)
+	_, responseBody, err := c.makeRequest(ctx, "GET", "/music/authors/"+slug+"/", nil, nil)
 	if err != nil {
 		return nil, fmt.Errorf("get author: %w", err)
 	}
@@ -456,7 +424,7 @@ func (c *Client) GetPlaylists(ctx context.Context) ([]*types.Playlist, error) {
 func (c *Client) GetPlaylist(ctx context.Context, slug string) (*types.Playlist, error) {
 	c.debugLog("Getting playlist: %s", slug)
 
-	_, responseBody, err := c.makeRequest(ctx, "GET", "/music/playlists/"+slug, nil, nil)
+	_, responseBody, err := c.makeRequest(ctx, "GET", "/music/playlists/"+slug+"/", nil, nil)
 	if err != nil {
 		return nil, fmt.Errorf("get playlist: %w", err)
 	}
@@ -489,7 +457,7 @@ func (c *Client) CreatePlaylist(ctx context.Context, playlist *types.Playlist) e
 func (c *Client) UpdatePlaylist(ctx context.Context, playlist *types.Playlist) error {
 	c.debugLog("Updating playlist: %s", playlist.Name)
 
-	_, responseBody, err := c.makeRequest(ctx, "PUT", "/music/playlists/"+playlist.Slug, nil, playlist)
+	_, responseBody, err := c.makeRequest(ctx, "PUT", "/music/playlists/"+playlist.Slug+"/", nil, playlist)
 	if err != nil {
 		return fmt.Errorf("update playlist: %w", err)
 	}
@@ -505,7 +473,7 @@ func (c *Client) UpdatePlaylist(ctx context.Context, playlist *types.Playlist) e
 func (c *Client) DeletePlaylist(ctx context.Context, slug string) error {
 	c.debugLog("Deleting playlist: %s", slug)
 
-	_, _, err := c.makeRequest(ctx, "DELETE", "/music/playlists/"+slug, nil, nil)
+	_, _, err := c.makeRequest(ctx, "DELETE", "/music/playlists/"+slug+"/", nil, nil)
 	if err != nil {
 		return fmt.Errorf("delete playlist: %w", err)
 	}
@@ -566,7 +534,7 @@ func (c *Client) SearchAll(ctx context.Context, query string) (*types.SearchResp
 	c.debugLog("Searching for: '%s'", query)
 
 	params := url.Values{}
-	params.Set("query", query)
+	params.Set("search", query)
 
 	_, responseBody, err := c.makeRequest(ctx, "GET", "/music/search/", params, nil)
 	if err != nil {

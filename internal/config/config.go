@@ -9,6 +9,7 @@ import (
 	"github.com/Alexander-D-Karpov/amp/internal/platform"
 )
 
+// Config represents the application configuration
 type Config struct {
 	Debug bool `mapstructure:"debug"`
 
@@ -72,6 +73,7 @@ type Config struct {
 	} `mapstructure:"user"`
 }
 
+// Load loads configuration from file or uses defaults
 func Load(configPath string) (*Config, error) {
 	viper.SetConfigName("config")
 	viper.SetConfigType("yaml")
@@ -111,6 +113,7 @@ func Load(configPath string) (*Config, error) {
 	return &cfg, nil
 }
 
+// DefaultMobileConfig returns a default configuration optimized for mobile devices
 func DefaultMobileConfig() *Config {
 	cfg := &Config{}
 	setDefaults()
@@ -188,6 +191,7 @@ func ensureDirectories(cfg *Config) error {
 	return nil
 }
 
+// Save saves the current configuration to file
 func (c *Config) Save() error {
 	configDir, err := platform.GetConfigDir()
 	if err != nil {

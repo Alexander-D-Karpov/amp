@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"strings"
 	"time"
 
 	"fyne.io/fyne/v2"
@@ -14,7 +15,10 @@ import (
 	"github.com/Alexander-D-Karpov/amp/internal/audio"
 	"github.com/Alexander-D-Karpov/amp/internal/config"
 	"github.com/Alexander-D-Karpov/amp/internal/download"
+	"github.com/Alexander-D-Karpov/amp/internal/handlers"
+	"github.com/Alexander-D-Karpov/amp/internal/media"
 	"github.com/Alexander-D-Karpov/amp/internal/search"
+	"github.com/Alexander-D-Karpov/amp/internal/services"
 	"github.com/Alexander-D-Karpov/amp/internal/storage"
 	"github.com/Alexander-D-Karpov/amp/internal/ui/components"
 	"github.com/Alexander-D-Karpov/amp/internal/ui/themes"
@@ -28,484 +32,424 @@ type App struct {
 	ctx     context.Context
 	cfg     *config.Config
 
+	core     *Core
+	ui       *UIComponents
+	state    *AppState
+	eventBus *handlers.EventBus
+
+	mainContainer *fyne.Container
+	lastSize      fyne.Size
+}
+
+type Core struct {
 	api             *api.Client
 	storage         *storage.Database
 	player          *audio.Player
-	search          *search.Engine
+	searchEngine    *search.SearchEngine
 	downloadManager *download.Manager
 	syncManager     *storage.SyncManager
+	imageLoader     *media.ImageLoader
+	musicService    *services.MusicService
+	imageService    *services.ImageService
+}
 
+type UIComponents struct {
 	playerBar        *components.PlayerBar
 	sidebar          *components.Sidebar
 	mainView         *views.MainView
 	authDialog       *components.AuthDialog
 	statusBar        *widget.Label
-	loadingIndicator *widget.ProgressBar
+	loadingIndicator *widget.ProgressBarInfinite
+}
 
+type AppState struct {
 	isAuthenticated bool
 	currentQueue    []*types.Song
 	currentIndex    int
-	lastWindowSize  fyne.Size
-
-	syncInProgress bool
+	compactMode     bool
+	syncInProgress  bool
 }
 
 func NewApp(ctx context.Context, fyneApp fyne.App, cfg *config.Config) (*App, error) {
 	fyneApp.Settings().SetTheme(themes.NewTheme(cfg.UI.Theme))
 
-	apiClient := api.NewClient(cfg)
-
-	storageDB, err := storage.NewDatabase(cfg)
+	core, err := initCore(cfg)
 	if err != nil {
-		return nil, fmt.Errorf("initialize database: %w", err)
+		return nil, fmt.Errorf("initialize core: %w", err)
 	}
-
-	syncManager := storage.NewSyncManager(apiClient, storageDB, cfg)
-
-	player, err := audio.NewPlayer(cfg)
-	if err != nil {
-		return nil, fmt.Errorf("initialize audio player: %w", err)
-	}
-
-	searchEngine := search.NewEngine(cfg, storageDB)
-	downloadManager := download.NewManager(cfg)
 
 	window := fyneApp.NewWindow("AMP - A(dvanced)karpov Music Player")
 	window.Resize(fyne.NewSize(float32(cfg.UI.WindowWidth), float32(cfg.UI.WindowHeight)))
 	window.CenterOnScreen()
 
 	app := &App{
-		fyneApp:         fyneApp,
-		window:          window,
-		ctx:             ctx,
-		cfg:             cfg,
-		api:             apiClient,
-		storage:         storageDB,
-		player:          player,
-		search:          searchEngine,
-		downloadManager: downloadManager,
-		syncManager:     syncManager,
-		currentQueue:    make([]*types.Song, 0),
-		currentIndex:    -1,
-		lastWindowSize:  window.Canvas().Size(),
+		fyneApp: fyneApp,
+		window:  window,
+		ctx:     ctx,
+		cfg:     cfg,
+		core:    core,
+		state: &AppState{
+			currentQueue: make([]*types.Song, 0),
+			currentIndex: -1,
+		},
+		eventBus: handlers.NewEventBus(),
+		lastSize: window.Canvas().Size(),
 	}
 
-	app.debugLog("AMP Application initializing...")
-
-	if err := app.setupUI(); err != nil {
-		return nil, fmt.Errorf("setup UI: %w", err)
+	if err := app.initUI(); err != nil {
+		return nil, fmt.Errorf("initialize UI: %w", err)
 	}
 
-	if err := app.setupEventHandlers(); err != nil {
-		return nil, fmt.Errorf("setup event handlers: %w", err)
-	}
-
+	app.setupEventHandlers()
 	app.setupKeyboardShortcuts()
 	app.loadSavedState()
 	app.startBackgroundTasks()
+	app.startResizePolling()
 
-	app.debugLog("AMP Application initialized successfully")
+	if cfg.Debug {
+		log.Printf("[APP] AMP Application initialized successfully")
+	}
 	return app, nil
 }
 
-func (a *App) debugLog(format string, args ...interface{}) {
-	if a.cfg.Debug {
-		log.Printf("[APP] "+format, args...)
+func initCore(cfg *config.Config) (*Core, error) {
+	apiClient := api.NewClient(cfg)
+	storageDB, err := storage.NewDatabase(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("initialize database: %w", err)
 	}
+	imageLoader, err := media.NewImageLoader(cfg, storageDB)
+	if err != nil {
+		return nil, fmt.Errorf("initialize image loader: %w", err)
+	}
+	player, err := audio.NewPlayer(cfg, storageDB)
+	if err != nil {
+		return nil, fmt.Errorf("initialize audio player: %w", err)
+	}
+	searchEngine := search.NewSearchEngine(cfg, storageDB)
+	downloadManager := download.NewManager(cfg)
+	syncManager := storage.NewSyncManager(apiClient, storageDB, cfg)
+	musicService := services.NewMusicService(apiClient, storageDB, searchEngine)
+	imageService := services.NewImageService(imageLoader)
+
+	return &Core{
+		api:             apiClient,
+		storage:         storageDB,
+		player:          player,
+		searchEngine:    searchEngine,
+		downloadManager: downloadManager,
+		syncManager:     syncManager,
+		imageLoader:     imageLoader,
+		musicService:    musicService,
+		imageService:    imageService,
+	}, nil
 }
 
-func (a *App) setupUI() error {
-	a.debugLog("Setting up UI components...")
+func (a *App) initUI() error {
+	a.ui = &UIComponents{
+		playerBar:        components.NewPlayerBar(a.core.player, a.core.storage),
+		sidebar:          components.NewSidebar(a.cfg),
+		authDialog:       components.NewAuthDialog(a.core.api),
+		statusBar:        widget.NewLabel("Ready"),
+		loadingIndicator: widget.NewProgressBarInfinite(),
+	}
 
-	a.playerBar = components.NewPlayerBar(a.player, a.storage)
-	a.playerBar.SetConfig(a.cfg)
+	a.ui.playerBar.SetConfig(a.cfg)
+	a.ui.loadingIndicator.Hide()
+	a.ui.mainView = views.NewMainView(a.core.musicService, a.core.imageService, a.core.downloadManager, a.cfg)
 
-	a.sidebar = components.NewSidebar(a.cfg)
-	a.mainView = views.NewMainView(a.api, a.storage, a.search, a.downloadManager, a.cfg)
-	a.authDialog = components.NewAuthDialog(a.api)
+	a.createLayout()
+	a.window.SetContent(a.mainContainer)
+	a.window.SetOnClosed(a.Close)
 
-	a.statusBar = widget.NewLabel("Ready")
-	a.loadingIndicator = widget.NewProgressBar()
-	a.loadingIndicator.Hide()
-
-	statusContainer := container.NewBorder(
-		nil, nil,
-		a.statusBar, a.loadingIndicator,
-		nil,
-	)
-
-	content := container.NewBorder(
-		nil,
-		a.playerBar.Container(),
-		a.sidebar.Container(),
-		nil,
-		a.mainView.Container(),
-	)
-
-	fullContent := container.NewBorder(
-		nil,
-		statusContainer,
-		nil,
-		nil,
-		content,
-	)
-
-	a.window.SetContent(fullContent)
-
-	// Set up window resize callback
-	a.window.SetOnClosed(func() {
-		a.Close()
-	})
-
-	// Monitor for window size changes
-	go a.monitorWindowResize()
-
-	a.debugLog("UI components setup complete")
+	a.handleWindowResize(a.window.Canvas().Size())
 	return nil
 }
 
-func (a *App) monitorWindowResize() {
-	ticker := time.NewTicker(100 * time.Millisecond)
-	defer ticker.Stop()
+func (a *App) createLayout() {
+	statusContainer := container.NewBorder(
+		nil, nil,
+		a.ui.statusBar, a.ui.loadingIndicator,
+		nil,
+	)
 
-	for {
-		select {
-		case <-a.ctx.Done():
-			return
-		case <-ticker.C:
-			a.handleWindowResize()
-		}
-	}
+	bottomBar := container.NewVBox(
+		a.ui.playerBar.Container(),
+		statusContainer,
+	)
+
+	a.mainContainer = container.NewBorder(nil, bottomBar, a.ui.sidebar, nil, a.ui.mainView.Container())
 }
 
-func (a *App) handleWindowResize() {
-	currentSize := a.window.Canvas().Size()
-	if currentSize != a.lastWindowSize {
-		a.debugLog("Window resized: %v -> %v", a.lastWindowSize, currentSize)
-		a.lastWindowSize = currentSize
-		a.updateLayoutForSize(currentSize)
-
-		a.cfg.UI.WindowWidth = int(currentSize.Width)
-		a.cfg.UI.WindowHeight = int(currentSize.Height)
-		go func() {
-			if err := a.cfg.Save(); err != nil {
-				a.debugLog("Failed to save window size: %v", err)
+func (a *App) startResizePolling() {
+	go func() {
+		for {
+			select {
+			case <-a.ctx.Done():
+				return
+			case <-time.After(200 * time.Millisecond):
+				if a.window == nil || a.window.Canvas() == nil {
+					continue
+				}
+				currentSize := a.window.Canvas().Size()
+				if currentSize.Width != a.lastSize.Width || currentSize.Height != a.lastSize.Height {
+					a.lastSize = currentSize
+					fyne.Do(func() {
+						a.handleWindowResize(currentSize)
+					})
+				}
 			}
-		}()
+		}
+	}()
+}
+
+func (a *App) handleWindowResize(size fyne.Size) {
+	isCompact := size.Width < a.ui.sidebar.GetBreakpoint()
+	if isCompact != a.state.compactMode {
+		a.state.compactMode = isCompact
+		a.ui.sidebar.SetCompactMode(isCompact)
+		a.ui.mainView.SetCompactMode(isCompact)
+		a.ui.playerBar.SetCompactMode(isCompact)
 	}
 }
 
-func (a *App) updateLayoutForSize(size fyne.Size) {
-	isCompact := size.Width < 800
+func (a *App) setupEventHandlers() {
+	a.ui.mainView.SettingsView.SetParentWindow(a.window)
 
-	a.debugLog("Updating layout - compact mode: %v (width: %.0f)", isCompact, size.Width)
-
-	a.sidebar.SetCompactMode(isCompact)
-	a.mainView.SetCompactMode(isCompact)
-
-	if size.Height < 600 {
-		a.playerBar.SetCompactMode(true)
-	} else {
-		a.playerBar.SetCompactMode(false)
-	}
-
-	a.mainView.RefreshLayout()
-}
-
-func (a *App) setupEventHandlers() error {
-	a.debugLog("Setting up event handlers...")
-
-	a.mainView.SettingsView.SetParentWindow(a.window)
-	a.mainView.PlaylistsView.SetParentWindow(a.window)
-
-	a.sidebar.OnNavigate(func(view string) {
-		a.debugLog("Navigation requested: %s", view)
-		a.mainView.ShowView(view)
+	a.ui.sidebar.OnNavigate(func(view string) {
+		a.ui.mainView.ShowView(view)
 		a.updateStatus("Viewing " + view)
 	})
 
-	a.sidebar.OnAuthRequested(func() {
-		if a.isAuthenticated {
-			a.debugLog("Logout requested")
+	a.ui.sidebar.OnAuthRequested(func() {
+		if a.state.isAuthenticated {
 			a.logout()
 		} else {
-			a.debugLog("Login requested")
-			a.authDialog.Show(a.window)
+			a.ui.authDialog.Show(a.window)
 		}
 	})
 
-	a.authDialog.OnAuthenticated(func(token string) {
-		a.debugLog("Authentication successful with token: %s...", token[:min(len(token), 10)])
+	a.ui.authDialog.OnAuthenticated(func(token string) {
 		a.handleAuthentication(token)
 	})
 
-	a.mainView.OnSongSelected(func(song *types.Song) {
-		a.debugLog("Song selected: %s by %s", song.Name, getArtistNames(song.Authors))
-		a.playSong(song)
+	a.ui.mainView.OnSongSelected(func(song *types.Song, playlist []*types.Song) {
+		a.playSong(song, playlist)
 	})
 
-	a.mainView.OnAlbumSelected(func(album *types.Album) {
-		a.debugLog("Album selected: %s", album.Name)
+	a.ui.mainView.OnAlbumSelected(func(album *types.Album) {
 		a.updateStatus(fmt.Sprintf("Selected album: %s", album.Name))
 	})
 
-	a.mainView.OnArtistSelected(func(artist *types.Author) {
-		a.debugLog("Artist selected: %s", artist.Name)
+	a.ui.mainView.OnArtistSelected(func(artist *types.Author) {
 		a.updateStatus(fmt.Sprintf("Selected artist: %s", artist.Name))
 	})
 
-	a.mainView.OnPlaylistSelected(func(playlist *types.Playlist) {
-		a.debugLog("Playlist selected: %s (%d songs)", playlist.Name, len(playlist.Songs))
+	a.ui.mainView.OnPlaylistSelected(func(playlist *types.Playlist) {
 		a.updateStatus(fmt.Sprintf("Selected playlist: %s", playlist.Name))
 		if len(playlist.Songs) > 0 {
 			a.playPlaylist(playlist)
 		}
 	})
 
-	a.playerBar.OnNext(func() {
-		a.debugLog("Next track requested")
+	a.ui.playerBar.OnNext(func() {
 		a.updateStatus("Next song")
 	})
 
-	a.playerBar.OnPrevious(func() {
-		a.debugLog("Previous track requested")
+	a.ui.playerBar.OnPrevious(func() {
 		a.updateStatus("Previous song")
 	})
 
-	a.playerBar.OnShuffle(func(enabled bool) {
-		a.debugLog("Shuffle toggled: %v", enabled)
-		a.updateStatus(fmt.Sprintf("Shuffle %s", map[bool]string{true: "enabled", false: "disabled"}[enabled]))
+	a.ui.playerBar.OnShuffle(func(enabled bool) {
+		status := "disabled"
+		if enabled {
+			status = "enabled"
+		}
+		a.updateStatus(fmt.Sprintf("Shuffle %s", status))
 	})
 
-	a.playerBar.OnRepeat(func(mode components.RepeatMode) {
-		a.debugLog("Repeat mode changed: %s", mode.String())
+	a.ui.playerBar.OnRepeat(func(mode components.RepeatMode) {
 		a.updateStatus(fmt.Sprintf("Repeat: %s", mode.String()))
 	})
 
-	a.downloadManager.OnProgress(func(progress *types.DownloadProgress) {
+	a.core.downloadManager.OnProgress(func(progress *types.DownloadProgress) {
 		switch progress.Status {
 		case types.DownloadStatusCompleted:
-			a.debugLog("Download completed: %s", progress.Filename)
 			a.updateStatus(fmt.Sprintf("Downloaded: %s", progress.Filename))
 		case types.DownloadStatusFailed:
-			a.debugLog("Download failed: %s - %v", progress.Filename, progress.Error)
 			a.updateStatus(fmt.Sprintf("Download failed: %s", progress.Filename))
 		}
 	})
 
 	a.setupSyncEventHandlers()
-
-	a.debugLog("Event handlers setup complete")
-	return nil
 }
 
 func (a *App) setupSyncEventHandlers() {
-	a.syncManager.OnProgress(func(status string, current, total int) {
-		if a.cfg.Debug {
-			a.debugLog("Sync progress: %s (%d/%d)", status, current, total)
-		}
-
-		if current < total {
+	a.core.syncManager.OnProgress(func(status string, current, total int) {
+		if total > 0 && current < total {
 			a.showLoading(true)
-			a.loadingIndicator.SetValue(float64(current) / float64(total))
 			a.updateStatus(status)
 		}
 	})
 
-	a.syncManager.OnError(func(err error) {
-		a.debugLog("Sync error: %v", err)
+	a.core.syncManager.OnError(func(err error) {
 		a.updateStatus(fmt.Sprintf("Sync error: %v", err))
 		a.showLoading(false)
+		a.state.syncInProgress = false
 	})
 
-	a.syncManager.OnComplete(func() {
-		a.debugLog("Sync completed successfully")
+	a.core.syncManager.OnComplete(func() {
 		a.updateStatus("Sync completed")
 		a.showLoading(false)
-		a.syncInProgress = false
-
+		a.state.syncInProgress = false
 		go func() {
-			a.mainView.RefreshData()
-			a.updateLibraryStats()
+			time.Sleep(100 * time.Millisecond)
+			fyne.Do(func() {
+				a.ui.mainView.RefreshData()
+				a.updateLibraryStats()
+			})
 		}()
 	})
 }
 
 func (a *App) setupKeyboardShortcuts() {
-	a.debugLog("Setting up keyboard shortcuts...")
-
 	a.window.Canvas().SetOnTypedKey(func(key *fyne.KeyEvent) {
 		switch key.Name {
 		case fyne.KeySpace:
-			if a.player.IsPlaying() {
-				_ = a.player.Pause()
-				a.debugLog("Playback paused via spacebar")
-				a.updateStatus("Paused")
+			if a.core.player.IsPlaying() {
+				a.core.player.Pause()
 			} else {
-				_ = a.player.Resume()
-				a.debugLog("Playback resumed via spacebar")
-				a.updateStatus("Playing")
+				a.core.player.Resume()
 			}
 		case fyne.KeyRight:
-			if key.Physical.ScanCode == 0 {
-				currentPos := a.player.GetPosition()
-				duration := a.player.GetDuration()
-				newPos := currentPos + 10*time.Second
-				if newPos > duration {
-					newPos = duration
-				}
-				_ = a.player.Seek(newPos)
-				a.debugLog("Seek forward: %v", newPos)
-			}
+			a.core.player.Seek(a.core.player.GetPosition() + 10*time.Second)
 		case fyne.KeyLeft:
-			if key.Physical.ScanCode == 0 {
-				currentPos := a.player.GetPosition()
-				newPos := currentPos - 10*time.Second
-				if newPos < 0 {
-					newPos = 0
-				}
-				_ = a.player.Seek(newPos)
-				a.debugLog("Seek backward: %v", newPos)
-			}
+			a.core.player.Seek(a.core.player.GetPosition() - 10*time.Second)
 		case fyne.KeyF:
 			a.window.SetFullScreen(!a.window.FullScreen())
-			a.debugLog("Fullscreen toggled: %v", a.window.FullScreen())
 		case fyne.KeyEscape:
 			if a.window.FullScreen() {
 				a.window.SetFullScreen(false)
-				a.debugLog("Exited fullscreen")
 			}
 		}
 	})
 
 	a.window.Canvas().SetOnTypedRune(func(r rune) {
-		if r == 'f' || r == 'F' {
+		if r == 's' || r == 'S' {
 			a.focusSearch()
 		}
 	})
 }
 
 func (a *App) loadSavedState() {
-	a.debugLog("Loading saved application state...")
-
 	if a.cfg.API.Token != "" && !a.cfg.User.IsAnonymous {
-		a.debugLog("Found saved authentication for user: %s", a.cfg.User.Username)
-		a.isAuthenticated = true
-		a.sidebar.SetAuthenticated(true, a.cfg.User.Username)
+		a.state.isAuthenticated = true
+		a.ui.sidebar.SetAuthenticated(true, a.cfg.User.Username)
 		a.startSync()
 	} else {
-		a.debugLog("No saved authentication found, initializing anonymous mode")
+		a.ui.sidebar.SetAuthenticated(false, "")
 		a.initializeAnonymous()
 	}
+	go func() {
+		time.Sleep(500 * time.Millisecond)
+		fyne.Do(func() {
+			a.loadInitialSongs()
+		})
+	}()
+}
+
+func (a *App) loadInitialSongs() {
+	ctx := context.Background()
+	songs, err := a.core.storage.GetSongs(ctx, 20, 0)
+	if err != nil || len(songs) > 0 {
+		return
+	}
+	go func() {
+		resp, err := a.core.api.GetSongs(ctx, 1, "")
+		if err == nil && len(resp.Results) > 0 {
+			fyne.Do(func() {
+				a.ui.mainView.RefreshData()
+			})
+		}
+	}()
 }
 
 func (a *App) initializeAnonymous() {
-	a.debugLog("Initializing anonymous mode...")
-	a.updateStatus("Initializing offline mode...")
-
+	a.updateStatus("Initializing anonymous session...")
 	go func() {
 		ctx := context.Background()
-
-		anonID, err := a.api.GetAnonymousToken(ctx)
+		anonID, err := a.core.api.GetAnonymousToken(ctx)
 		if err != nil {
-			a.debugLog("Failed to get anonymous token: %v", err)
-			a.updateStatus("Offline mode - no network")
-		} else {
-			a.cfg.User.AnonymousID = anonID
-			if err := a.cfg.Save(); err != nil {
-				a.debugLog("Failed to save anonymous token: %v", err)
-			} else {
-				a.debugLog("Anonymous token saved successfully")
-			}
+			a.updateStatus("Offline mode")
+			return
 		}
-
-		a.startSync()
+		a.cfg.User.AnonymousID = anonID
+		a.cfg.Save()
 	}()
 }
 
 func (a *App) handleAuthentication(token string) {
-	a.isAuthenticated = true
+	a.state.isAuthenticated = true
 	a.cfg.API.Token = token
 	a.cfg.User.IsAnonymous = false
-	a.api.SetToken(token)
+	a.core.api.SetToken(token)
 
 	go func() {
 		ctx := context.Background()
-		if user, err := a.api.GetCurrentUser(ctx); err == nil {
-			a.cfg.User.ID = user.ID
-			a.cfg.User.Username = user.Username
-			a.cfg.User.Email = user.Email
-			if user.ImageCropped != nil {
-				a.cfg.User.Image = *user.ImageCropped
-			}
-
-			if err := a.cfg.Save(); err != nil {
-				a.debugLog("Failed to save user info: %v", err)
-			} else {
-				a.debugLog("User info saved: %s (%s)", user.Username, user.Email)
-			}
-		} else {
-			a.debugLog("Failed to get user info: %v", err)
+		user, err := a.core.api.GetCurrentUser(ctx)
+		if err != nil {
+			return
 		}
+		a.cfg.User.ID = user.ID
+		a.cfg.User.Username = user.Username
+		a.cfg.User.Email = user.Email
+		if user.ImageCropped != nil {
+			a.cfg.User.Image = *user.ImageCropped
+		}
+		a.cfg.Save()
+		fyne.Do(func() {
+			a.ui.sidebar.SetAuthenticated(true, user.Username)
+		})
 	}()
-
-	a.sidebar.SetAuthenticated(true, a.cfg.User.Username)
 	a.updateStatus("Authenticated successfully")
 	a.startSync()
 }
 
 func (a *App) startBackgroundTasks() {
-	a.debugLog("Starting background tasks...")
-
 	go func() {
 		ticker := time.NewTicker(30 * time.Second)
 		defer ticker.Stop()
-
 		for {
 			select {
 			case <-a.ctx.Done():
-				a.debugLog("Background task stopping: library stats updater")
 				return
 			case <-ticker.C:
 				a.updateLibraryStats()
 			}
 		}
 	}()
-
-	go func() {
-		ticker := time.NewTicker(5 * time.Second)
-		defer ticker.Stop()
-
-		for {
-			select {
-			case <-a.ctx.Done():
-				a.debugLog("Background task stopping: download checker")
-				return
-			case <-ticker.C:
-				a.checkDownloads()
-			}
-		}
-	}()
-
-	a.debugLog("Background tasks started")
 }
 
-func (a *App) playSong(song *types.Song) {
-	a.currentQueue = []*types.Song{song}
-	a.currentIndex = 0
-
-	a.playerBar.SetQueue(a.currentQueue, a.currentIndex)
+func (a *App) playSong(song *types.Song, playlist []*types.Song) {
+	if a.cfg.Debug {
+		log.Printf("[APP] Playing song: %s", song.Name)
+	}
+	a.state.currentQueue = playlist
+	a.state.currentIndex = -1
+	for i, s := range a.state.currentQueue {
+		if s.Slug == song.Slug {
+			a.state.currentIndex = i
+			break
+		}
+	}
+	if a.state.currentIndex == -1 {
+		a.state.currentQueue = []*types.Song{song}
+		a.state.currentIndex = 0
+	}
+	a.ui.playerBar.SetQueue(a.state.currentQueue, a.state.currentIndex)
 	a.updateStatus(fmt.Sprintf("Playing: %s", song.Name))
-
 	if a.cfg.Download.AutoDownload && !song.Downloaded {
-		go func() {
-			ctx := context.Background()
-			if err := a.downloadManager.DownloadSong(ctx, song); err != nil {
-				a.debugLog("Auto-download failed for %s: %v", song.Name, err)
-			} else {
-				a.debugLog("Auto-download started for: %s", song.Name)
-			}
-		}()
+		go a.core.downloadManager.DownloadSong(context.Background(), song)
 	}
 }
 
@@ -514,166 +458,117 @@ func (a *App) playPlaylist(playlist *types.Playlist) {
 		a.updateStatus("Playlist is empty")
 		return
 	}
-
-	a.currentQueue = playlist.Songs
-	a.currentIndex = 0
-
-	a.playerBar.SetQueue(a.currentQueue, a.currentIndex)
+	a.state.currentQueue = playlist.Songs
+	a.state.currentIndex = 0
+	a.ui.playerBar.SetQueue(a.state.currentQueue, a.state.currentIndex)
 	a.updateStatus(fmt.Sprintf("Playing playlist: %s", playlist.Name))
 }
 
 func (a *App) startSync() {
-	if a.syncInProgress {
-		a.debugLog("Sync already in progress, skipping")
+	if a.state.syncInProgress {
 		return
 	}
-
-	a.debugLog("Starting sync process...")
-	a.syncInProgress = true
+	a.state.syncInProgress = true
 	a.updateStatus("Starting sync...")
 	a.showLoading(true)
-
-	go func() {
-		a.syncManager.Start(a.ctx)
-	}()
+	go a.core.syncManager.Start(a.ctx)
 }
 
 func (a *App) logout() {
-	a.debugLog("Logging out user: %s", a.cfg.User.Username)
-
-	go func() {
-		ctx := context.Background()
-		if err := a.api.Logout(ctx); err != nil {
-			a.debugLog("API logout failed: %v", err)
-		}
-	}()
-
-	a.isAuthenticated = false
+	go a.core.api.Logout(context.Background())
+	a.state.isAuthenticated = false
 	a.cfg.API.Token = ""
 	a.cfg.User.IsAnonymous = true
 	a.cfg.User.Username = ""
 	a.cfg.User.Email = ""
 	a.cfg.User.Image = ""
 	a.cfg.User.AnonymousID = ""
-
-	if err := a.cfg.Save(); err != nil {
-		a.debugLog("Failed to save logout state: %v", err)
-	}
-
-	a.sidebar.SetAuthenticated(false, "")
-	a.syncManager.Stop()
-	a.api.SetToken("")
-
+	a.cfg.Save()
+	a.ui.sidebar.SetAuthenticated(false, "")
+	a.core.syncManager.Stop()
+	a.core.api.SetToken("")
 	a.initializeAnonymous()
 	a.updateStatus("Logged out")
 }
 
 func (a *App) updateStatus(message string) {
-	a.statusBar.SetText(message)
-
-	go func() {
-		time.Sleep(5 * time.Second)
-		a.statusBar.SetText("Ready")
-	}()
+	fyne.Do(func() {
+		if a.ui.statusBar != nil {
+			a.ui.statusBar.SetText(message)
+		}
+	})
+	time.AfterFunc(5*time.Second, func() {
+		fyne.Do(func() {
+			if a.ui.statusBar != nil && a.ui.statusBar.Text == message {
+				a.ui.statusBar.SetText("Ready")
+			}
+		})
+	})
 }
 
 func (a *App) showLoading(show bool) {
-	if show {
-		a.loadingIndicator.Show()
-	} else {
-		a.loadingIndicator.Hide()
-	}
+	fyne.Do(func() {
+		if a.ui.loadingIndicator != nil {
+			if show {
+				a.ui.loadingIndicator.Show()
+			} else {
+				a.ui.loadingIndicator.Hide()
+			}
+		}
+	})
 }
 
 func (a *App) updateLibraryStats() {
 	go func() {
 		ctx := context.Background()
-		songs, err := a.storage.GetSongs(ctx, 10000, 0)
+		songs, err := a.core.storage.GetSongs(ctx, 100000, 0)
 		if err != nil {
-			a.debugLog("Failed to get songs for stats: %v", err)
 			return
 		}
-
-		totalPlayed := 0
+		totalSeconds := 0
 		for _, song := range songs {
-			totalPlayed += song.Played * song.Length
+			totalSeconds += song.Played * song.Length
 		}
-
-		hours := totalPlayed / 3600
-		minutes := (totalPlayed % 3600) / 60
+		hours := totalSeconds / 3600
+		minutes := (totalSeconds % 3600) / 60
 		timeListened := fmt.Sprintf("%dh %dm", hours, minutes)
-
-		a.sidebar.UpdateStats(len(songs), timeListened)
-
-		if a.cfg.Debug && len(songs) > 0 {
-			a.debugLog("Library stats updated - Songs: %d, Time listened: %s", len(songs), timeListened)
-		}
+		fyne.Do(func() {
+			if a.ui.sidebar != nil {
+				a.ui.sidebar.UpdateStats(len(songs), timeListened)
+			}
+		})
 	}()
 }
 
-func (a *App) checkDownloads() {
-	downloads := a.downloadManager.GetAllDownloads()
-	activeDownloads := 0
-
-	for _, download := range downloads {
-		if download.Status == types.DownloadStatusDownloading {
-			activeDownloads++
-		}
-	}
-
-	if activeDownloads > 0 && a.cfg.Debug {
-		a.debugLog("Active downloads: %d", activeDownloads)
-	}
-}
-
 func (a *App) focusSearch() {
-	a.debugLog("Focusing search in current view: %s", a.mainView.GetCurrentView())
-	a.mainView.SearchInCurrentView("")
+	a.ui.mainView.SearchInCurrentView("")
 }
 
 func (a *App) ShowAndRun() {
-	a.debugLog("Starting AMP application window...")
 	a.window.ShowAndRun()
 }
 
 func (a *App) Close() {
-	a.debugLog("Shutting down AMP application...")
-
-	if a.syncManager != nil {
-		a.syncManager.Stop()
+	if a.core.syncManager != nil {
+		a.core.syncManager.Stop()
 	}
-
-	if a.player != nil {
-		if err := a.player.Close(); err != nil {
-			a.debugLog("Error closing audio player: %v", err)
-		}
+	if a.core.player != nil {
+		a.core.player.Close()
 	}
-
-	if a.storage != nil {
-		if err := a.storage.Close(); err != nil {
-			a.debugLog("Error closing database: %v", err)
-		}
+	if a.core.storage != nil {
+		a.core.storage.Close()
 	}
-
-	a.debugLog("AMP application shutdown complete")
 }
 
 func getArtistNames(authors []*types.Author) string {
 	if len(authors) == 0 {
 		return "Unknown Artist"
 	}
-	if len(authors) == 1 {
-		return authors[0].Name
+	names := make([]string, len(authors))
+	for i, author := range authors {
+		if author != nil {
+			names[i] = author.Name
+		}
 	}
-	if len(authors) == 2 {
-		return fmt.Sprintf("%s & %s", authors[0].Name, authors[1].Name)
-	}
-	return fmt.Sprintf("%s & %d others", authors[0].Name, len(authors)-1)
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
+	return strings.Join(names, ", ")
 }

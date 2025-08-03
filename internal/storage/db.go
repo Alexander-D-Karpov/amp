@@ -54,7 +54,9 @@ func NewDatabase(cfg *config.Config) (*Database, error) {
 	}
 
 	if err := storage.runMigrations(); err != nil {
-		storage.Close()
+		if closeErr := storage.Close(); closeErr != nil {
+			log.Printf("Failed to close database after migration error: %v", closeErr)
+		}
 		return nil, fmt.Errorf("run migrations: %w", err)
 	}
 
@@ -90,13 +92,17 @@ func openDatabase(dbPath string, enableWAL bool) (*sql.DB, error) {
 
 	for _, pragma := range pragmas {
 		if _, err := db.Exec(pragma); err != nil {
-			db.Close()
+			if closeErr := db.Close(); closeErr != nil {
+				log.Printf("Failed to close database after pragma error: %v", closeErr)
+			}
 			return nil, fmt.Errorf("execute pragma %s: %w", pragma, err)
 		}
 	}
 
 	if err := db.Ping(); err != nil {
-		db.Close()
+		if closeErr := db.Close(); closeErr != nil {
+			log.Printf("Failed to close database after ping error: %v", closeErr)
+		}
 		return nil, fmt.Errorf("ping database: %w", err)
 	}
 
@@ -104,16 +110,11 @@ func openDatabase(dbPath string, enableWAL bool) (*sql.DB, error) {
 }
 
 func (d *Database) debugLog(operation string, err error, duration time.Duration) {
-	if !d.debug {
+	if !d.debug || err == nil {
 		return
 	}
 
-	status := "SUCCESS"
-	if err != nil {
-		status = "ERROR"
-	}
-
-	log.Printf("[DB] %s - %s - %v - %v", operation, status, duration, err)
+	log.Printf("[DB] %s failed in %v: %v", operation, duration, err)
 }
 
 func (d *Database) checkClosed() error {
@@ -154,7 +155,11 @@ func (d *Database) GetSongs(ctx context.Context, limit, offset int) ([]*types.So
 		d.debugLog("GetSongs", err, time.Since(start))
 		return nil, fmt.Errorf("query songs: %w", err)
 	}
-	defer func() { _ = rows.Close() }()
+	defer func() {
+		if closeErr := rows.Close(); closeErr != nil {
+			log.Printf("Failed to close rows: %v", closeErr)
+		}
+	}()
 
 	var songs []*types.Song
 	for rows.Next() {
@@ -221,7 +226,12 @@ func (d *Database) GetSong(ctx context.Context, slug string) (*types.Song, error
 
 func (d *Database) SaveSong(ctx context.Context, song *types.Song) error {
 	start := time.Now()
-	defer func() { d.debugLog("SaveSong", nil, time.Since(start)) }()
+	err := fmt.Errorf("save song: %w", nil)
+	defer func(err *error) {
+		if *err != nil {
+			d.debugLog("SaveSong", *err, time.Since(start))
+		}
+	}(&err)
 
 	if err := d.checkClosed(); err != nil {
 		return err
@@ -231,10 +241,26 @@ func (d *Database) SaveSong(ctx context.Context, song *types.Song) error {
 		Isolation: sql.LevelReadCommitted,
 	})
 	if err != nil {
-		d.debugLog("SaveSong", err, time.Since(start))
 		return fmt.Errorf("begin transaction: %w", err)
 	}
-	defer func() { _ = tx.Rollback() }()
+	defer func() {
+		if rollbackErr := tx.Rollback(); rollbackErr != nil && rollbackErr != sql.ErrTxDone {
+			log.Printf("Failed to rollback transaction: %v", rollbackErr)
+		}
+	}()
+
+	if song.Album != nil {
+		if err := d.saveAlbumInTx(ctx, tx, song.Album); err != nil {
+			return fmt.Errorf("save album: %w", err)
+		}
+		song.AlbumSlug = song.Album.Slug
+	}
+
+	for _, author := range song.Authors {
+		if err := d.saveAuthorInTx(ctx, tx, author); err != nil {
+			return fmt.Errorf("save author: %w", err)
+		}
+	}
 
 	volumeJSON := "[]"
 	if len(song.Volume) > 0 {
@@ -264,12 +290,10 @@ func (d *Database) SaveSong(ctx context.Context, song *types.Song) error {
 		song.CreatedAt, song.UpdatedAt,
 	)
 	if err != nil {
-		d.debugLog("SaveSong", err, time.Since(start))
 		return fmt.Errorf("insert song: %w", err)
 	}
 
 	if err := d.saveSongAuthors(ctx, tx, song); err != nil {
-		d.debugLog("SaveSong", err, time.Since(start))
 		return fmt.Errorf("save song authors: %w", err)
 	}
 
@@ -304,26 +328,33 @@ func (d *Database) SearchSongs(ctx context.Context, query string, limit int) ([]
 		       COALESCE(a.name, '') as album_name, 
 		       COALESCE(a.image, '') as album_image, 
 		       COALESCE(a.image_cropped, '') as album_image_cropped, 
-		       COALESCE(a.link, '') as album_link,
-		       bm25(songs_fts) as rank
-		FROM songs_fts
-		JOIN songs s ON songs_fts.rowid = s.rowid
+		       COALESCE(a.link, '') as album_link
+		FROM songs s
 		LEFT JOIN albums a ON s.album_slug = a.slug
-		WHERE songs_fts MATCH ?
-		ORDER BY rank
+		WHERE s.name LIKE ? OR EXISTS (
+			SELECT 1 FROM song_authors sa 
+			JOIN authors au ON sa.author_slug = au.slug 
+			WHERE sa.song_slug = s.slug AND au.name LIKE ?
+		)
+		ORDER BY s.created_at DESC
 		LIMIT ?
 	`
 
-	rows, err := d.db.QueryContext(ctx, searchQuery, query, limit)
+	searchPattern := "%" + query + "%"
+	rows, err := d.db.QueryContext(ctx, searchQuery, searchPattern, searchPattern, limit)
 	if err != nil {
 		d.debugLog("SearchSongs", err, time.Since(start))
 		return nil, fmt.Errorf("search songs: %w", err)
 	}
-	defer func() { _ = rows.Close() }()
+	defer func() {
+		if closeErr := rows.Close(); closeErr != nil {
+			log.Printf("Failed to close rows: %v", closeErr)
+		}
+	}()
 
 	var songs []*types.Song
 	for rows.Next() {
-		song, err := d.scanSongWithRank(rows)
+		song, err := d.scanSong(rows)
 		if err != nil {
 			d.debugLog("SearchSongs", err, time.Since(start))
 			return nil, fmt.Errorf("scan song: %w", err)
@@ -359,7 +390,11 @@ func (d *Database) GetAlbums(ctx context.Context, limit, offset int) ([]*types.A
 		d.debugLog("GetAlbums", err, time.Since(start))
 		return nil, fmt.Errorf("query albums: %w", err)
 	}
-	defer func() { _ = rows.Close() }()
+	defer func() {
+		if closeErr := rows.Close(); closeErr != nil {
+			log.Printf("Failed to close rows: %v", closeErr)
+		}
+	}()
 
 	var albums []*types.Album
 	for rows.Next() {
@@ -428,6 +463,26 @@ func (d *Database) SaveAlbum(ctx context.Context, album *types.Album) error {
 	return err
 }
 
+func (d *Database) saveAlbumInTx(ctx context.Context, tx *sql.Tx, album *types.Album) error {
+	query := `
+		INSERT OR REPLACE INTO albums (
+			slug, name, image, image_cropped, link, last_sync, created_at, updated_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+	`
+
+	now := time.Now()
+	if album.CreatedAt.IsZero() {
+		album.CreatedAt = now
+	}
+	album.UpdatedAt = now
+
+	_, err := tx.ExecContext(ctx, query,
+		album.Slug, album.Name, album.Image, album.ImageCropped,
+		album.Link, album.LastSync, album.CreatedAt, album.UpdatedAt,
+	)
+	return err
+}
+
 func (d *Database) GetAuthors(ctx context.Context, limit, offset int) ([]*types.Author, error) {
 	start := time.Now()
 	defer func() { d.debugLog("GetAuthors", nil, time.Since(start)) }()
@@ -448,7 +503,11 @@ func (d *Database) GetAuthors(ctx context.Context, limit, offset int) ([]*types.
 		d.debugLog("GetAuthors", err, time.Since(start))
 		return nil, fmt.Errorf("query authors: %w", err)
 	}
-	defer func() { _ = rows.Close() }()
+	defer func() {
+		if closeErr := rows.Close(); closeErr != nil {
+			log.Printf("Failed to close rows: %v", closeErr)
+		}
+	}()
 
 	var authors []*types.Author
 	for rows.Next() {
@@ -517,6 +576,26 @@ func (d *Database) SaveAuthor(ctx context.Context, author *types.Author) error {
 	return err
 }
 
+func (d *Database) saveAuthorInTx(ctx context.Context, tx *sql.Tx, author *types.Author) error {
+	query := `
+		INSERT OR REPLACE INTO authors (
+			slug, name, image, image_cropped, link, last_sync, created_at, updated_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+	`
+
+	now := time.Now()
+	if author.CreatedAt.IsZero() {
+		author.CreatedAt = now
+	}
+	author.UpdatedAt = now
+
+	_, err := tx.ExecContext(ctx, query,
+		author.Slug, author.Name, author.Image, author.ImageCropped,
+		author.Link, author.LastSync, author.CreatedAt, author.UpdatedAt,
+	)
+	return err
+}
+
 func (d *Database) GetPlaylists(ctx context.Context) ([]*types.Playlist, error) {
 	start := time.Now()
 	defer func() { d.debugLog("GetPlaylists", nil, time.Since(start)) }()
@@ -536,7 +615,11 @@ func (d *Database) GetPlaylists(ctx context.Context) ([]*types.Playlist, error) 
 		d.debugLog("GetPlaylists", err, time.Since(start))
 		return nil, fmt.Errorf("query playlists: %w", err)
 	}
-	defer func() { _ = rows.Close() }()
+	defer func() {
+		if closeErr := rows.Close(); closeErr != nil {
+			log.Printf("Failed to close rows: %v", closeErr)
+		}
+	}()
 
 	var playlists []*types.Playlist
 	for rows.Next() {
@@ -598,7 +681,11 @@ func (d *Database) SavePlaylist(ctx context.Context, playlist *types.Playlist) e
 		d.debugLog("SavePlaylist", err, time.Since(start))
 		return fmt.Errorf("begin transaction: %w", err)
 	}
-	defer func() { _ = tx.Rollback() }()
+	defer func() {
+		if rollbackErr := tx.Rollback(); rollbackErr != nil && rollbackErr != sql.ErrTxDone {
+			log.Printf("Failed to rollback transaction: %v", rollbackErr)
+		}
+	}()
 
 	query := `
 		INSERT OR REPLACE INTO playlists (
@@ -696,11 +783,17 @@ func (d *Database) SaveCachedFile(ctx context.Context, url string, data io.Reade
 		d.debugLog("SaveCachedFile", err, time.Since(start))
 		return "", fmt.Errorf("create file: %w", err)
 	}
-	defer func() { _ = file.Close() }()
+	defer func() {
+		if closeErr := file.Close(); closeErr != nil {
+			log.Printf("Failed to close file: %v", closeErr)
+		}
+	}()
 
 	size, err := io.Copy(file, data)
 	if err != nil {
-		_ = os.Remove(localPath)
+		if removeErr := os.Remove(localPath); removeErr != nil {
+			log.Printf("Failed to remove file after write error: %v", removeErr)
+		}
 		d.debugLog("SaveCachedFile", err, time.Since(start))
 		return "", fmt.Errorf("write file: %w", err)
 	}
@@ -714,7 +807,9 @@ func (d *Database) SaveCachedFile(ctx context.Context, url string, data io.Reade
 	now := time.Now()
 	_, err = d.db.ExecContext(ctx, query, filename, url, localPath, size, now, now)
 	if err != nil {
-		_ = os.Remove(localPath)
+		if removeErr := os.Remove(localPath); removeErr != nil {
+			log.Printf("Failed to remove file after database error: %v", removeErr)
+		}
 		d.debugLog("SaveCachedFile", err, time.Since(start))
 		return "", fmt.Errorf("save cache entry: %w", err)
 	}
@@ -761,44 +856,9 @@ func (d *Database) scanSong(scanner interface {
 	}
 
 	if volumeJSON != "" && volumeJSON != "[]" {
-		_ = json.Unmarshal([]byte(volumeJSON), &song.Volume)
-	}
-
-	if albumSlugRef != "" {
-		song.Album = &types.Album{
-			Slug:         albumSlugRef,
-			Name:         albumName,
-			Image:        stringToPtr(albumImage),
-			ImageCropped: stringToPtr(albumImageCropped),
-			Link:         albumLink,
+		if unmarshalErr := json.Unmarshal([]byte(volumeJSON), &song.Volume); unmarshalErr != nil {
+			log.Printf("Failed to unmarshal volume JSON: %v", unmarshalErr)
 		}
-	}
-
-	return &song, nil
-}
-
-func (d *Database) scanSongWithRank(scanner interface {
-	Scan(dest ...interface{}) error
-}) (*types.Song, error) {
-	var song types.Song
-	var volumeJSON string
-	var albumSlugRef, albumName, albumImage, albumImageCropped, albumLink string
-	var rank float64
-
-	err := scanner.Scan(
-		&song.Slug, &song.Name, &song.File, &song.Image, &song.ImageCropped,
-		&song.Length, &song.Played, &song.Link, &song.Liked, &volumeJSON,
-		&song.AlbumSlug, &song.LocalPath, &song.Downloaded, &song.LastSync,
-		&song.CreatedAt, &song.UpdatedAt,
-		&albumSlugRef, &albumName, &albumImage, &albumImageCropped, &albumLink,
-		&rank,
-	)
-	if err != nil {
-		return nil, err
-	}
-
-	if volumeJSON != "" && volumeJSON != "[]" {
-		_ = json.Unmarshal([]byte(volumeJSON), &song.Volume)
 	}
 
 	if albumSlugRef != "" {
@@ -892,7 +952,11 @@ func (d *Database) loadSongAuthors(ctx context.Context, songs []*types.Song) err
 	if err != nil {
 		return fmt.Errorf("query song authors: %w", err)
 	}
-	defer func() { _ = rows.Close() }()
+	defer func() {
+		if closeErr := rows.Close(); closeErr != nil {
+			log.Printf("Failed to close rows: %v", closeErr)
+		}
+	}()
 
 	authorMap := make(map[string][]*types.Author)
 	for rows.Next() {
@@ -940,26 +1004,6 @@ func (d *Database) saveSongAuthors(ctx context.Context, tx *sql.Tx, song *types.
 	return nil
 }
 
-func (d *Database) saveAuthorInTx(ctx context.Context, tx *sql.Tx, author *types.Author) error {
-	query := `
-		INSERT OR REPLACE INTO authors (
-			slug, name, image, image_cropped, link, last_sync, created_at, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-	`
-
-	now := time.Now()
-	if author.CreatedAt.IsZero() {
-		author.CreatedAt = now
-	}
-	author.UpdatedAt = now
-
-	_, err := tx.ExecContext(ctx, query,
-		author.Slug, author.Name, author.Image, author.ImageCropped,
-		author.Link, author.LastSync, author.CreatedAt, author.UpdatedAt,
-	)
-	return err
-}
-
 func (d *Database) loadPlaylistSongs(ctx context.Context, playlist *types.Playlist) error {
 	query := `
 		SELECT s.slug, s.name, s.file, s.image, s.image_cropped, s.length, 
@@ -981,7 +1025,11 @@ func (d *Database) loadPlaylistSongs(ctx context.Context, playlist *types.Playli
 	if err != nil {
 		return fmt.Errorf("query playlist songs: %w", err)
 	}
-	defer func() { _ = rows.Close() }()
+	defer func() {
+		if closeErr := rows.Close(); closeErr != nil {
+			log.Printf("Failed to close rows: %v", closeErr)
+		}
+	}()
 
 	var songs []*types.Song
 	for rows.Next() {

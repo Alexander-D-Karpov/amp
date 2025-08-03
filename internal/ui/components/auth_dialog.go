@@ -140,7 +140,7 @@ func (ad *AuthDialog) authenticate(token string) {
 		if err != nil {
 			log.Printf("Authentication failed: %v", err)
 			ad.statusLabel.SetText("Authentication failed: " + err.Error())
-			ad.showError("Authentication failed", err)
+			ad.showError(err)
 			return
 		}
 
@@ -163,7 +163,7 @@ func (ad *AuthDialog) setUIEnabled(enabled bool) {
 	}
 }
 
-func (ad *AuthDialog) showError(title string, err error) {
+func (ad *AuthDialog) showError(err error) {
 	if ad.parentWindow != nil {
 		errorDialog := dialog.NewError(err, ad.parentWindow)
 		errorDialog.Show()

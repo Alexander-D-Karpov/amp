@@ -100,13 +100,17 @@ coverage.html
 *.ogg
 *.m4a
 
-# Images
+# Images (except icons)
 *.jpg
 *.jpeg
 *.png
 *.gif
 *.bmp
 *.webp
+
+# Allow specific icon
+!assets/icon.png
+!Icon.png
 
 # Documents
 *.pdf

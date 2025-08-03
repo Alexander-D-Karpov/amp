@@ -8,7 +8,6 @@ func (d *Database) runMigrations() error {
 	migrations := []string{
 		createTables,
 		createIndexes,
-		createFTS,
 	}
 
 	for i, migration := range migrations {
@@ -71,6 +70,14 @@ CREATE TABLE IF NOT EXISTS song_authors (
 	FOREIGN KEY (author_slug) REFERENCES authors(slug) ON DELETE CASCADE
 );
 
+CREATE TABLE IF NOT EXISTS album_artists (
+	album_slug TEXT NOT NULL,
+	author_slug TEXT NOT NULL,
+	PRIMARY KEY (album_slug, author_slug),
+	FOREIGN KEY (album_slug) REFERENCES albums(slug) ON DELETE CASCADE,
+	FOREIGN KEY (author_slug) REFERENCES authors(slug) ON DELETE CASCADE
+);
+
 CREATE TABLE IF NOT EXISTS playlists (
 	slug TEXT PRIMARY KEY,
 	name TEXT NOT NULL,
@@ -126,9 +133,13 @@ CREATE INDEX IF NOT EXISTS idx_songs_album ON songs(album_slug);
 CREATE INDEX IF NOT EXISTS idx_songs_downloaded ON songs(downloaded);
 CREATE INDEX IF NOT EXISTS idx_songs_last_sync ON songs(last_sync);
 CREATE INDEX IF NOT EXISTS idx_songs_created_at ON songs(created_at);
+CREATE INDEX IF NOT EXISTS idx_songs_name ON songs(name);
 
 CREATE INDEX IF NOT EXISTS idx_song_authors_song ON song_authors(song_slug);
 CREATE INDEX IF NOT EXISTS idx_song_authors_author ON song_authors(author_slug);
+
+CREATE INDEX IF NOT EXISTS idx_album_artists_album ON album_artists(album_slug);
+CREATE INDEX IF NOT EXISTS idx_album_artists_author ON album_artists(author_slug);
 
 CREATE INDEX IF NOT EXISTS idx_playlist_songs_playlist ON playlist_songs(playlist_slug);
 CREATE INDEX IF NOT EXISTS idx_playlist_songs_position ON playlist_songs(playlist_slug, position);
@@ -139,25 +150,7 @@ CREATE INDEX IF NOT EXISTS idx_play_history_played_at ON play_history(played_at)
 
 CREATE INDEX IF NOT EXISTS idx_cache_entries_url ON cache_entries(url);
 CREATE INDEX IF NOT EXISTS idx_cache_entries_accessed_at ON cache_entries(accessed_at);
-`
 
-const createFTS = `
-CREATE VIRTUAL TABLE IF NOT EXISTS songs_fts USING fts5(
-	name, 
-	content='songs', 
-	content_rowid='rowid'
-);
-
-CREATE TRIGGER IF NOT EXISTS songs_fts_insert AFTER INSERT ON songs BEGIN
-	INSERT INTO songs_fts(rowid, name) VALUES (new.rowid, new.name);
-END;
-
-CREATE TRIGGER IF NOT EXISTS songs_fts_delete AFTER DELETE ON songs BEGIN
-	INSERT INTO songs_fts(songs_fts, rowid, name) VALUES('delete', old.rowid, old.name);
-END;
-
-CREATE TRIGGER IF NOT EXISTS songs_fts_update AFTER UPDATE ON songs BEGIN
-	INSERT INTO songs_fts(songs_fts, rowid, name) VALUES('delete', old.rowid, old.name);
-	INSERT INTO songs_fts(rowid, name) VALUES (new.rowid, new.name);
-END;
+CREATE INDEX IF NOT EXISTS idx_authors_name ON authors(name);
+CREATE INDEX IF NOT EXISTS idx_albums_name ON albums(name);
 `

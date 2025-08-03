@@ -4,6 +4,7 @@ import (
 	"time"
 )
 
+// Song represents a music track with metadata and playback information
 type Song struct {
 	Slug         string    `json:"slug" db:"slug"`
 	Name         string    `json:"name" db:"name"`
@@ -27,6 +28,7 @@ type Song struct {
 	UpdatedAt  time.Time `json:"-" db:"updated_at"`
 }
 
+// Album represents a music album containing multiple songs
 type Album struct {
 	Slug         string    `json:"slug" db:"slug"`
 	Name         string    `json:"name" db:"name"`
@@ -42,6 +44,7 @@ type Album struct {
 	UpdatedAt time.Time `json:"-" db:"updated_at"`
 }
 
+// Author represents a music artist or author
 type Author struct {
 	Slug         string   `json:"slug" db:"slug"`
 	Name         string   `json:"name" db:"name"`
@@ -57,6 +60,7 @@ type Author struct {
 	UpdatedAt time.Time `json:"-" db:"updated_at"`
 }
 
+// Playlist represents a collection of songs organized by a user
 type Playlist struct {
 	Slug    string   `json:"slug" db:"slug"`
 	Name    string   `json:"name" db:"name"`
@@ -72,6 +76,7 @@ type Playlist struct {
 	UpdatedAt time.Time `json:"-" db:"updated_at"`
 }
 
+// User represents a user account in the music system
 type User struct {
 	ID           int     `json:"id"`
 	Username     string  `json:"username"`
@@ -80,6 +85,7 @@ type User struct {
 	URL          string  `json:"url"`
 }
 
+// Meta contains additional metadata about music tracks
 type Meta struct {
 	Genre       *string    `json:"genre"`
 	Lyrics      *string    `json:"lyrics"`
@@ -88,6 +94,7 @@ type Meta struct {
 	TrackSource *string    `json:"track_source"`
 }
 
+// SongListResponse represents a paginated list of songs from the API
 type SongListResponse struct {
 	Count    int     `json:"count"`
 	Next     *string `json:"next"`
@@ -95,6 +102,7 @@ type SongListResponse struct {
 	Results  []*Song `json:"results"`
 }
 
+// AlbumListResponse represents a paginated list of albums from the API
 type AlbumListResponse struct {
 	Count    int      `json:"count"`
 	Next     *string  `json:"next"`
@@ -102,6 +110,7 @@ type AlbumListResponse struct {
 	Results  []*Album `json:"results"`
 }
 
+// AuthorListResponse represents a paginated list of authors from the API
 type AuthorListResponse struct {
 	Count    int       `json:"count"`
 	Next     *string   `json:"next"`
@@ -109,12 +118,14 @@ type AuthorListResponse struct {
 	Results  []*Author `json:"results"`
 }
 
+// SearchResponse represents search results from the API
 type SearchResponse struct {
 	Songs   []*Song   `json:"songs"`
 	Albums  []*Album  `json:"albums"`
 	Authors []*Author `json:"authors"`
 }
 
+// SearchResults represents local search results
 type SearchResults struct {
 	Songs   []*Song   `json:"songs"`
 	Albums  []*Album  `json:"albums"`
@@ -122,10 +133,12 @@ type SearchResults struct {
 	Total   int       `json:"total"`
 }
 
+// AuthResponse represents an authentication response from the API
 type AuthResponse struct {
 	Token string `json:"token"`
 }
 
+// PlayHistory represents a record of song playback
 type PlayHistory struct {
 	ID        int64     `db:"id"`
 	SongSlug  string    `db:"song_slug"`
@@ -135,6 +148,7 @@ type PlayHistory struct {
 	CreatedAt time.Time `db:"created_at"`
 }
 
+// DownloadItem represents a download task
 type DownloadItem struct {
 	URL         string     `db:"url"`
 	LocalPath   string     `db:"local_path"`
@@ -145,6 +159,7 @@ type DownloadItem struct {
 	CompletedAt *time.Time `db:"completed_at"`
 }
 
+// CacheEntry represents a cached file entry
 type CacheEntry struct {
 	Key        string    `db:"key"`
 	URL        string    `db:"url"`

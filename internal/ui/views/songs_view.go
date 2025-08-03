@@ -6,6 +6,7 @@ import (
 	"log"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"fyne.io/fyne/v2"
@@ -13,512 +14,568 @@ import (
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 
-	"github.com/Alexander-D-Karpov/amp/internal/api"
-	"github.com/Alexander-D-Karpov/amp/internal/search"
-	"github.com/Alexander-D-Karpov/amp/internal/storage"
+	"github.com/Alexander-D-Karpov/amp/internal/handlers"
+	"github.com/Alexander-D-Karpov/amp/internal/services"
+	"github.com/Alexander-D-Karpov/amp/internal/ui/components"
 	"github.com/Alexander-D-Karpov/amp/pkg/types"
 )
 
 type SongsView struct {
-	api     *api.Client
-	storage *storage.Database
-	search  *search.Engine
+	musicService *services.MusicService
+	imageService *services.ImageService
+	handlers     *handlers.UIHandlers
 
-	container     *fyne.Container
-	scroll        *container.Scroll
-	searchEntry   *widget.Entry
-	songsGrid     *fyne.Container
-	songsList     *widget.List
-	refreshBtn    *widget.Button
-	viewToggleBtn *widget.Button
-	sortSelect    *widget.Select
-	filterSelect  *widget.Select
+	container       *fyne.Container
+	mediaGrid       *components.MediaGrid
+	searchEntry     *widget.Entry
+	refreshBtn      *widget.Button
+	viewToggleBtn   *widget.Button
+	sortSelect      *widget.Select
+	filterSelect    *widget.Select
+	loader          *widget.ProgressBarInfinite
+	statusLabel     *widget.Label
+	scrollContainer *container.Scroll
 
-	songs          []*types.Song
-	filteredSongs  []*types.Song
-	onSongSelected func(*types.Song)
-	isGridView     bool
-	searchTimer    *time.Timer
-	compactMode    bool
-
-	currentPage int
-	hasMore     bool
-	loading     bool
+	mu            sync.RWMutex
+	songs         []*types.Song
+	filteredSongs []*types.Song
+	allSongs      []*types.Song
+	isGridView    bool
+	compactMode   bool
+	searchTimer   *time.Timer
+	currentPage   int
+	hasMore       bool
+	loading       bool
+	loadingMore   bool
+	lastSearch    string
+	debug         bool
+	searchCache   map[string][]*types.Song
 }
 
-type SortOption string
-
-const (
-	SortByName     SortOption = "Name"
-	SortByArtist   SortOption = "Artist"
-	SortByAlbum    SortOption = "Album"
-	SortByDuration SortOption = "Duration"
-	SortByPlayed   SortOption = "Play Count"
-)
-
-func NewSongsView(api *api.Client, storage *storage.Database, search *search.Engine) *SongsView {
+func NewSongsView(musicService *services.MusicService, imageService *services.ImageService, handlers *handlers.UIHandlers) *SongsView {
 	sv := &SongsView{
-		api:         api,
-		storage:     storage,
-		search:      search,
-		currentPage: 1,
-		hasMore:     true,
+		musicService:  musicService,
+		imageService:  imageService,
+		handlers:      handlers,
+		currentPage:   1,
+		hasMore:       true,
+		isGridView:    true,
+		songs:         make([]*types.Song, 0),
+		filteredSongs: make([]*types.Song, 0),
+		allSongs:      make([]*types.Song, 0),
+		debug:         true,
+		searchCache:   make(map[string][]*types.Song),
 	}
 
 	sv.setupWidgets()
 	sv.setupLayout()
 	sv.loadSongs()
-
 	return sv
 }
 
 func (sv *SongsView) setupWidgets() {
 	sv.searchEntry = widget.NewEntry()
 	sv.searchEntry.SetPlaceHolder("Search songs...")
-	sv.searchEntry.OnChanged = sv.onSearchDebounced
+	sv.searchEntry.OnChanged = sv.onSearchChanged
 
-	sv.refreshBtn = widget.NewButtonWithIcon("", theme.ViewRefreshIcon(), sv.refreshData)
-	sv.viewToggleBtn = widget.NewButtonWithIcon("", theme.ListIcon(), sv.toggleView)
+	sv.refreshBtn = widget.NewButtonWithIcon("", theme.ViewRefreshIcon(), sv.Refresh)
+	sv.viewToggleBtn = widget.NewButtonWithIcon("", theme.GridIcon(), sv.toggleView)
 
 	sv.sortSelect = widget.NewSelect([]string{
-		"Name A-Z", "Name Z-A", "Artist A-Z", "Album A-Z", "Duration", "Play Count",
+		"Date Added", "Name A-Z", "Name Z-A", "Artist A-Z", "Duration", "Play Count",
 	}, sv.onSortChanged)
+	sv.sortSelect.SetSelected("Date Added")
 
 	sv.filterSelect = widget.NewSelect([]string{
-		"All Songs", "Downloaded", "Liked", "Recently Played",
+		"All Songs", "Downloaded", "Liked",
 	}, sv.onFilterChanged)
-
-	sv.songsList = widget.NewList(
-		func() int {
-			return len(sv.filteredSongs)
-		},
-		func() fyne.CanvasObject {
-			return sv.createSongListItem()
-		},
-		func(id widget.ListItemID, obj fyne.CanvasObject) {
-			sv.updateSongListItem(id, obj)
-		},
-	)
-	sv.songsList.OnSelected = sv.onSongListSelected
-
-	sv.songsGrid = container.NewGridWithColumns(4)
-	sv.isGridView = false
-
-	sv.sortSelect.SetSelected("Name A-Z")
 	sv.filterSelect.SetSelected("All Songs")
-}
 
-func (sv *SongsView) SetCompactMode(compact bool) {
-	sv.compactMode = compact
+	sv.mediaGrid = components.NewMediaGrid(fyne.NewSize(180, 220), sv.imageService)
+	sv.mediaGrid.SetItemTapCallback(sv.onGridItemTapped)
 
-	if compact {
-		sv.songsGrid = container.NewGridWithColumns(2)
-	} else {
-		sv.songsGrid = container.NewGridWithColumns(4)
-	}
+	sv.loader = widget.NewProgressBarInfinite()
+	sv.loader.Hide()
 
-	if sv.isGridView {
-		sv.showGridView()
-	}
-	sv.setupLayout()
-}
-
-func (sv *SongsView) createSongListItem() fyne.CanvasObject {
-	cover := widget.NewIcon(theme.MediaMusicIcon())
-	cover.Resize(fyne.NewSize(48, 48))
-
-	titleLabel := widget.NewLabel("Song Title")
-	titleLabel.TextStyle = fyne.TextStyle{Bold: true}
-
-	artistLabel := widget.NewLabel("Artist")
-	albumLabel := widget.NewLabel("Album")
-
-	durationLabel := widget.NewLabel("3:45")
-	statusIcon := widget.NewIcon(theme.DownloadIcon())
-	statusIcon.Resize(fyne.NewSize(16, 16))
-	statusIcon.Hide()
-
-	likeBtn := widget.NewButtonWithIcon("", theme.VisibilityOffIcon(), func() {
-	})
-	likeBtn.Importance = widget.LowImportance
-
-	playBtn := widget.NewButtonWithIcon("", theme.MediaPlayIcon(), func() {
-	})
-	playBtn.Importance = widget.LowImportance
-
-	songInfo := container.NewVBox(
-		titleLabel,
-		container.NewHBox(artistLabel, widget.NewLabel("•"), albumLabel),
-	)
-
-	rightSection := container.NewHBox(
-		durationLabel,
-		statusIcon,
-		likeBtn,
-		playBtn,
-	)
-
-	return container.NewBorder(
-		nil, nil,
-		cover,
-		rightSection,
-		songInfo,
-	)
-}
-
-func (sv *SongsView) updateSongListItem(id widget.ListItemID, obj fyne.CanvasObject) {
-	if id >= len(sv.filteredSongs) {
-		return
-	}
-
-	song := sv.filteredSongs[id]
-	c := obj.(*fyne.Container)
-
-	var songInfo *fyne.Container
-	var rightSection *fyne.Container
-
-	for _, o := range c.Objects {
-		if cont, ok := o.(*fyne.Container); ok {
-			if len(cont.Objects) == 2 {
-				songInfo = cont
-			} else {
-				rightSection = cont
-			}
-		}
-	}
-
-	if songInfo != nil && len(songInfo.Objects) >= 2 {
-		titleLabel := songInfo.Objects[0].(*widget.Label)
-		detailsContainer := songInfo.Objects[1].(*fyne.Container)
-
-		titleLabel.SetText(song.Name)
-
-		if len(detailsContainer.Objects) >= 3 {
-			artistLabel := detailsContainer.Objects[0].(*widget.Label)
-			albumLabel := detailsContainer.Objects[2].(*widget.Label)
-
-			if len(song.Authors) > 0 {
-				artistLabel.SetText(song.Authors[0].Name)
-			} else {
-				artistLabel.SetText("Unknown Artist")
-			}
-
-			if song.Album != nil {
-				albumLabel.SetText(song.Album.Name)
-			} else {
-				albumLabel.SetText("Unknown Album")
-			}
-		}
-	}
-
-	if rightSection != nil && len(rightSection.Objects) >= 4 {
-		durationLabel := rightSection.Objects[0].(*widget.Label)
-		statusIcon := rightSection.Objects[1].(*widget.Icon)
-		likeBtn := rightSection.Objects[2].(*widget.Button)
-
-		duration := time.Duration(song.Length) * time.Second
-		durationLabel.SetText(formatDuration(duration))
-
-		if song.Downloaded {
-			statusIcon.SetResource(theme.ConfirmIcon())
-			statusIcon.Show()
-		} else {
-			statusIcon.Hide()
-		}
-
-		if song.Liked != nil && *song.Liked {
-			likeBtn.SetIcon(theme.ConfirmIcon())
-		} else {
-			likeBtn.SetIcon(theme.VisibilityOffIcon())
-		}
-	}
-}
-
-func (sv *SongsView) onSongListSelected(id widget.ListItemID) {
-	if id < len(sv.filteredSongs) && sv.onSongSelected != nil {
-		sv.onSongSelected(sv.filteredSongs[id])
-	}
-}
-
-func (sv *SongsView) createSongCard(song *types.Song) fyne.CanvasObject {
-	cover := widget.NewIcon(theme.MediaMusicIcon())
-
-	cardSize := fyne.NewSize(150, 150)
-	if sv.compactMode {
-		cardSize = fyne.NewSize(120, 120)
-	}
-	cover.Resize(cardSize)
-
-	if song.ImageCropped != nil && *song.ImageCropped != "" {
-		cover.SetResource(theme.MediaMusicIcon())
-	}
-
-	titleLabel := widget.NewLabel(song.Name)
-	titleLabel.TextStyle = fyne.TextStyle{Bold: true}
-	titleLabel.Alignment = fyne.TextAlignCenter
-	titleLabel.Wrapping = fyne.TextWrapWord
-
-	var artistText string
-	if len(song.Authors) > 0 {
-		artistText = song.Authors[0].Name
-	} else {
-		artistText = "Unknown Artist"
-	}
-
-	artistLabel := widget.NewLabel(artistText)
-	artistLabel.Alignment = fyne.TextAlignCenter
-
-	duration := time.Duration(song.Length) * time.Second
-	durationLabel := widget.NewLabel(formatDuration(duration))
-	durationLabel.Alignment = fyne.TextAlignCenter
-	durationLabel.TextStyle = fyne.TextStyle{Italic: true}
-
-	cardContent := container.NewVBox(
-		cover,
-		titleLabel,
-		artistLabel,
-		durationLabel,
-	)
-
-	cardBtn := widget.NewButton("", func() {
-		if sv.onSongSelected != nil {
-			sv.onSongSelected(song)
-		}
-	})
-	cardBtn.Importance = widget.LowImportance
-
-	card := widget.NewCard("", "", cardContent)
-
-	return container.NewStack(card, cardBtn)
+	sv.statusLabel = widget.NewLabel("Loading songs...")
 }
 
 func (sv *SongsView) setupLayout() {
-	searchContainer := container.NewBorder(nil, nil, nil, container.NewHBox(sv.viewToggleBtn, sv.refreshBtn), sv.searchEntry)
-	controlsContainer := container.NewHBox(widget.NewLabel("Sort:"), sv.sortSelect, widget.NewLabel("Filter:"), sv.filterSelect)
-	header := container.NewVBox(searchContainer, controlsContainer)
+	searchBar := container.NewBorder(nil, nil, nil,
+		container.NewHBox(sv.viewToggleBtn, sv.refreshBtn),
+		sv.searchEntry)
 
-	sv.scroll = container.NewScroll(sv.songsList)
-	sv.container = container.NewBorder(header, nil, nil, nil, sv.scroll)
+	controls := container.NewHBox(
+		widget.NewLabel("Sort:"), sv.sortSelect,
+		widget.NewLabel("Filter:"), sv.filterSelect)
+
+	header := container.NewVBox(searchBar, controls, sv.statusLabel)
+
+	sv.scrollContainer = container.NewScroll(sv.mediaGrid)
+	sv.scrollContainer.OnScrolled = sv.onScrolled
+
+	sv.container = container.NewBorder(header, sv.loader, nil, nil, sv.scrollContainer)
+}
+
+func (sv *SongsView) onScrolled(pos fyne.Position) {
+	if sv.loadingMore || !sv.hasMore {
+		return
+	}
+
+	scrollSize := sv.scrollContainer.Size()
+	contentSize := sv.mediaGrid.MinSize()
+
+	if pos.Y >= contentSize.Height-scrollSize.Height-100 {
+		if sv.debug {
+			log.Printf("[SONGS_VIEW] Near bottom, loading more songs")
+		}
+		sv.loadMoreSongs()
+	}
+}
+
+func (sv *SongsView) onGridItemTapped(index int) {
+	sv.mu.RLock()
+	defer sv.mu.RUnlock()
+
+	if index < len(sv.filteredSongs) && sv.handlers != nil {
+		song := sv.filteredSongs[index]
+		if sv.debug {
+			log.Printf("[SONGS_VIEW] Song selected: %s by %s", song.Name, getArtistNames(song.Authors))
+		}
+		sv.handlers.HandleSongSelection(song, sv.filteredSongs)
+	}
 }
 
 func (sv *SongsView) toggleView() {
 	sv.isGridView = !sv.isGridView
-	if sv.isGridView {
-		sv.viewToggleBtn.SetIcon(theme.GridIcon())
-		sv.showGridView()
-	} else {
-		sv.viewToggleBtn.SetIcon(theme.ListIcon())
-		sv.showListView()
-	}
-}
-
-func (sv *SongsView) showGridView() {
-	sv.songsGrid.RemoveAll()
-	for _, song := range sv.filteredSongs {
-		sv.songsGrid.Add(sv.createSongCard(song))
-	}
-
-	if sv.hasMore && !sv.loading {
-		loadMoreBtn := widget.NewButton("Load More", func() {
-			sv.loadMoreSongs()
-		})
-		sv.songsGrid.Add(loadMoreBtn)
-	}
-
-	sv.scroll.Content = sv.songsGrid
-	sv.scroll.Refresh()
-}
-
-func (sv *SongsView) showListView() {
-	sv.scroll.Content = sv.songsList
-	sv.scroll.Refresh()
-	sv.songsList.Refresh()
-}
-
-func (sv *SongsView) loadSongs() {
-	sv.currentPage = 1
-	sv.hasMore = true
-	go func() {
-		ctx := context.Background()
-		songs, err := sv.storage.GetSongs(ctx, 1000, 0)
-		if err != nil {
-			log.Printf("Failed to load songs from storage: %v", err)
-			sv.loadFromAPI()
-			return
+	fyne.Do(func() {
+		if sv.isGridView {
+			sv.viewToggleBtn.SetIcon(theme.GridIcon())
+		} else {
+			sv.viewToggleBtn.SetIcon(theme.ListIcon())
 		}
-
-		sv.songs = songs
-		sv.filteredSongs = songs
-		sv.refreshView()
-	}()
+		sv.updateGridView()
+	})
 }
 
-func (sv *SongsView) loadFromAPI() {
-	if sv.loading {
+func (sv *SongsView) updateGridView() {
+	if sv.mediaGrid == nil {
 		return
 	}
 
+	sv.mu.RLock()
+	songs := make([]*types.Song, len(sv.filteredSongs))
+	copy(songs, sv.filteredSongs)
+	sv.mu.RUnlock()
+
+	if sv.debug {
+		log.Printf("[SONGS_VIEW] Updating grid with %d songs", len(songs))
+	}
+
+	var items []components.MediaItem
+	if len(songs) == 0 {
+		fyne.Do(func() {
+			sv.statusLabel.SetText("No songs found")
+		})
+	} else {
+		fyne.Do(func() {
+			sv.statusLabel.SetText(fmt.Sprintf("Showing %d songs", len(songs)))
+		})
+		items = make([]components.MediaItem, len(songs))
+		for i, song := range songs {
+			if song != nil {
+				items[i] = components.MediaItemFromSong(song)
+				if sv.debug && i < 5 {
+					log.Printf("[SONGS_VIEW] Added song to grid: %s", song.Name)
+				}
+			}
+		}
+	}
+
+	sv.mediaGrid.SetItems(items)
+	if len(songs) > 100 {
+		sv.mediaGrid.SetVirtualScroll(true)
+	}
+}
+
+func (sv *SongsView) onSearchChanged(query string) {
+	if sv.searchTimer != nil {
+		sv.searchTimer.Stop()
+	}
+	sv.searchTimer = time.AfterFunc(300*time.Millisecond, func() {
+		sv.performSearch(query)
+	})
+}
+
+func (sv *SongsView) performSearch(query string) {
+	sv.mu.Lock()
+	sv.lastSearch = query
+	sv.currentPage = 1
+	sv.hasMore = true
+	sv.mu.Unlock()
+
+	if sv.debug {
+		log.Printf("[SONGS_VIEW] Performing search for: '%s'", query)
+	}
+
+	if query == "" {
+		sv.mu.Lock()
+		sv.filteredSongs = make([]*types.Song, len(sv.allSongs))
+		copy(sv.filteredSongs, sv.allSongs)
+		sv.mu.Unlock()
+
+		sv.applySortAndFilter()
+		fyne.Do(func() {
+			sv.updateGridView()
+		})
+		return
+	}
+
+	if cached, exists := sv.searchCache[query]; exists {
+		sv.mu.Lock()
+		sv.songs = cached
+		sv.filteredSongs = make([]*types.Song, len(cached))
+		copy(sv.filteredSongs, cached)
+		sv.mu.Unlock()
+
+		sv.applySortAndFilter()
+		fyne.Do(func() {
+			sv.updateGridView()
+		})
+		return
+	}
+
+	sv.loadSongsWithSearch(query)
+}
+
+func (sv *SongsView) loadSongsWithSearch(query string) {
+	sv.mu.Lock()
+	if sv.loading {
+		sv.mu.Unlock()
+		return
+	}
 	sv.loading = true
+	sv.mu.Unlock()
+
+	fyne.Do(func() {
+		if sv.loader != nil {
+			sv.loader.Show()
+		}
+		if sv.statusLabel != nil {
+			sv.statusLabel.SetText("Searching...")
+		}
+	})
+
 	go func() {
-		defer func() { sv.loading = false }()
+		defer func() {
+			sv.mu.Lock()
+			sv.loading = false
+			sv.mu.Unlock()
+			fyne.Do(func() {
+				if sv.loader != nil {
+					sv.loader.Hide()
+				}
+			})
+		}()
 
 		ctx := context.Background()
-		resp, err := sv.api.GetSongs(ctx, sv.currentPage, "")
+
+		if sv.debug {
+			log.Printf("[SONGS_VIEW] Loading songs with search - query: '%s'", query)
+		}
+
+		songs, hasMore, err := sv.musicService.GetSongs(ctx, 1, query)
 		if err != nil {
-			log.Printf("Failed to load songs from API: %v", err)
+			if sv.debug {
+				log.Printf("[SONGS_VIEW] Error searching songs: %v", err)
+			}
+			fyne.Do(func() {
+				if sv.statusLabel != nil {
+					sv.statusLabel.SetText(fmt.Sprintf("Search error: %v", err))
+				}
+			})
 			return
 		}
 
-		if sv.currentPage == 1 {
-			sv.songs = resp.Results
-		} else {
-			sv.songs = append(sv.songs, resp.Results...)
+		if sv.debug {
+			log.Printf("[SONGS_VIEW] Search returned %d songs", len(songs))
 		}
 
-		sv.hasMore = resp.Next != nil
-		sv.filteredSongs = sv.songs
-		sv.refreshView()
+		sv.mu.Lock()
+		sv.songs = songs
+		sv.filteredSongs = make([]*types.Song, len(songs))
+		copy(sv.filteredSongs, songs)
+		sv.hasMore = hasMore
+		sv.searchCache[query] = songs
+		sv.applySortAndFilter()
+		sv.mu.Unlock()
+
+		fyne.Do(func() {
+			sv.updateGridView()
+		})
+	}()
+}
+
+func (sv *SongsView) onSortChanged(option string) {
+	sv.applySortAndFilter()
+	fyne.Do(func() {
+		sv.updateGridView()
+	})
+}
+
+func (sv *SongsView) onFilterChanged(filter string) {
+	sv.applySortAndFilter()
+	fyne.Do(func() {
+		sv.updateGridView()
+	})
+}
+
+func (sv *SongsView) loadSongs() {
+	sv.mu.Lock()
+	if sv.loading {
+		sv.mu.Unlock()
+		return
+	}
+	sv.loading = true
+	query := sv.lastSearch
+	page := sv.currentPage
+	sv.mu.Unlock()
+
+	fyne.Do(func() {
+		if sv.loader != nil {
+			sv.loader.Show()
+		}
+		if sv.statusLabel != nil {
+			sv.statusLabel.SetText("Loading songs...")
+		}
+	})
+
+	go func() {
+		defer func() {
+			sv.mu.Lock()
+			sv.loading = false
+			sv.mu.Unlock()
+			fyne.Do(func() {
+				if sv.loader != nil {
+					sv.loader.Hide()
+				}
+			})
+		}()
+
+		ctx := context.Background()
+
+		if sv.debug {
+			log.Printf("[SONGS_VIEW] Loading songs - page: %d, query: '%s'", page, query)
+		}
+
+		songs, hasMore, err := sv.musicService.GetSongs(ctx, page, query)
+		if err != nil {
+			if sv.debug {
+				log.Printf("[SONGS_VIEW] Error loading songs: %v", err)
+			}
+			fyne.Do(func() {
+				if sv.statusLabel != nil {
+					sv.statusLabel.SetText(fmt.Sprintf("Error: %v", err))
+				}
+			})
+			return
+		}
+
+		if sv.debug {
+			log.Printf("[SONGS_VIEW] Loaded %d songs from service", len(songs))
+		}
+
+		sv.mu.Lock()
+		if page == 1 {
+			sv.songs = songs
+			sv.allSongs = make([]*types.Song, len(songs))
+			copy(sv.allSongs, songs)
+		} else {
+			sv.songs = append(sv.songs, songs...)
+			sv.allSongs = append(sv.allSongs, songs...)
+		}
+		sv.hasMore = hasMore
+		sv.applySortAndFilter()
+		sv.mu.Unlock()
+
+		fyne.Do(func() {
+			sv.updateGridView()
+		})
 	}()
 }
 
 func (sv *SongsView) loadMoreSongs() {
-	if sv.loading || !sv.hasMore {
+	sv.mu.Lock()
+	if sv.loadingMore || !sv.hasMore || sv.loading {
+		sv.mu.Unlock()
+		return
+	}
+	sv.loadingMore = true
+	sv.currentPage++
+	page := sv.currentPage
+	query := sv.lastSearch
+	sv.mu.Unlock()
+
+	if sv.debug {
+		log.Printf("[SONGS_VIEW] Loading more songs - page: %d", page)
+	}
+
+	go func() {
+		defer func() {
+			sv.mu.Lock()
+			sv.loadingMore = false
+			sv.mu.Unlock()
+		}()
+
+		ctx := context.Background()
+		songs, hasMore, err := sv.musicService.GetSongs(ctx, page, query)
+		if err != nil {
+			if sv.debug {
+				log.Printf("[SONGS_VIEW] Error loading more songs: %v", err)
+			}
+			return
+		}
+
+		if sv.debug {
+			log.Printf("[SONGS_VIEW] Loaded %d more songs", len(songs))
+		}
+
+		sv.mu.Lock()
+		sv.songs = append(sv.songs, songs...)
+		sv.allSongs = append(sv.allSongs, songs...)
+		sv.hasMore = hasMore
+		sv.applySortAndFilter()
+		sv.mu.Unlock()
+
+		fyne.Do(func() {
+			sv.updateGridView()
+		})
+	}()
+}
+
+func (sv *SongsView) applySortAndFilter() {
+	if sv.sortSelect == nil || sv.filterSelect == nil {
+		sv.filteredSongs = sv.songs
 		return
 	}
 
-	sv.currentPage++
-	sv.loadFromAPI()
-}
-
-func (sv *SongsView) refreshData() {
-	sv.currentPage = 1
-	sv.hasMore = true
-	sv.songs = nil
-	sv.filteredSongs = nil
-	sv.loadFromAPI()
-}
-
-func (sv *SongsView) onSearchDebounced(query string) {
-	if sv.searchTimer != nil {
-		sv.searchTimer.Stop()
-	}
-
-	sv.searchTimer = time.AfterFunc(300*time.Millisecond, func() {
-		sv.onSearch(query)
-	})
-}
-
-func (sv *SongsView) onSearch(query string) {
-	if query == "" {
-		sv.filteredSongs = sv.songs
-	} else {
-		ctx := context.Background()
-		results, err := sv.search.Search(ctx, query, 100)
-		if err != nil {
-			log.Printf("Search error: %v", err)
-			return
-		}
-		sv.filteredSongs = results.Songs
-	}
-	sv.refreshView()
-}
-
-func (sv *SongsView) onSortChanged(option string) {
-	switch option {
-	case "Name A-Z":
-		sort.Slice(sv.filteredSongs, func(i, j int) bool {
-			return strings.ToLower(sv.filteredSongs[i].Name) < strings.ToLower(sv.filteredSongs[j].Name)
-		})
-	case "Name Z-A":
-		sort.Slice(sv.filteredSongs, func(i, j int) bool {
-			return strings.ToLower(sv.filteredSongs[i].Name) > strings.ToLower(sv.filteredSongs[j].Name)
-		})
-	case "Artist A-Z":
-		sort.Slice(sv.filteredSongs, func(i, j int) bool {
-			artistI := "Unknown"
-			if len(sv.filteredSongs[i].Authors) > 0 {
-				artistI = sv.filteredSongs[i].Authors[0].Name
-			}
-			artistJ := "Unknown"
-			if len(sv.filteredSongs[j].Authors) > 0 {
-				artistJ = sv.filteredSongs[j].Authors[0].Name
-			}
-			return strings.ToLower(artistI) < strings.ToLower(artistJ)
-		})
-	case "Album A-Z":
-		sort.Slice(sv.filteredSongs, func(i, j int) bool {
-			albumI := "Unknown"
-			if sv.filteredSongs[i].Album != nil {
-				albumI = sv.filteredSongs[i].Album.Name
-			}
-			albumJ := "Unknown"
-			if sv.filteredSongs[j].Album != nil {
-				albumJ = sv.filteredSongs[j].Album.Name
-			}
-			return strings.ToLower(albumI) < strings.ToLower(albumJ)
-		})
-	case "Duration":
-		sort.Slice(sv.filteredSongs, func(i, j int) bool {
-			return sv.filteredSongs[i].Length > sv.filteredSongs[j].Length
-		})
-	case "Play Count":
-		sort.Slice(sv.filteredSongs, func(i, j int) bool {
-			return sv.filteredSongs[i].Played > sv.filteredSongs[j].Played
-		})
-	}
-	sv.refreshView()
-}
-
-func (sv *SongsView) onFilterChanged(filter string) {
 	filtered := make([]*types.Song, 0)
+	var filter string
+	fyne.Do(func() {
+		if sv.filterSelect != nil {
+			filter = sv.filterSelect.Selected
+		}
+	})
 
 	for _, song := range sv.songs {
+		if song == nil {
+			continue
+		}
 		include := false
 		switch filter {
-		case "All Songs":
+		case "All Songs", "":
 			include = true
 		case "Downloaded":
 			include = song.Downloaded
 		case "Liked":
 			include = song.Liked != nil && *song.Liked
-		case "Recently Played":
-			include = song.Played > 0
+		default:
+			include = true
 		}
-
 		if include {
 			filtered = append(filtered, song)
 		}
 	}
 
+	var sortOpt string
+	fyne.Do(func() {
+		if sv.sortSelect != nil {
+			sortOpt = sv.sortSelect.Selected
+		}
+	})
+
+	sort.Slice(filtered, func(i, j int) bool {
+		s1, s2 := filtered[i], filtered[j]
+		if s1 == nil || s2 == nil {
+			return false
+		}
+		switch sortOpt {
+		case "Name A-Z":
+			return strings.ToLower(s1.Name) < strings.ToLower(s2.Name)
+		case "Name Z-A":
+			return strings.ToLower(s1.Name) > strings.ToLower(s2.Name)
+		case "Artist A-Z":
+			return getFirstAuthor(s1) < getFirstAuthor(s2)
+		case "Duration":
+			return s1.Length > s2.Length
+		case "Play Count":
+			return s1.Played > s2.Played
+		case "Date Added", "":
+			return s1.CreatedAt.After(s2.CreatedAt)
+		}
+		return false
+	})
+
 	sv.filteredSongs = filtered
-	sv.refreshView()
-}
 
-func (sv *SongsView) refreshView() {
-	if sv.scroll == nil {
-		return
-	}
-	if sv.isGridView {
-		sv.showGridView()
-	} else {
-		sv.songsList.Refresh()
+	if sv.debug {
+		log.Printf("[SONGS_VIEW] Applied filter '%s' and sort '%s', result: %d songs", filter, sortOpt, len(sv.filteredSongs))
 	}
 }
 
-func (sv *SongsView) OnSongSelected(callback func(*types.Song)) {
-	sv.onSongSelected = callback
+func (sv *SongsView) SetCompactMode(compact bool) {
+	sv.compactMode = compact
+
+	fyne.Do(func() {
+		sv.mediaGrid.SetCompactMode(compact)
+		sv.updateGridView()
+	})
 }
 
 func (sv *SongsView) Refresh() {
-	sv.refreshData()
+	if sv.debug {
+		log.Printf("[SONGS_VIEW] Manual refresh requested")
+	}
+
+	sv.mu.Lock()
+	sv.currentPage = 1
+	sv.hasMore = true
+	sv.songs = make([]*types.Song, 0)
+	sv.allSongs = make([]*types.Song, 0)
+	sv.filteredSongs = make([]*types.Song, 0)
+	sv.searchCache = make(map[string][]*types.Song)
+	sv.mu.Unlock()
+
+	if sv.lastSearch != "" {
+		sv.performSearch(sv.lastSearch)
+	} else {
+		sv.loadSongs()
+	}
 }
 
 func (sv *SongsView) Container() *fyne.Container {
 	return sv.container
 }
 
-func formatDuration(d time.Duration) string {
-	minutes := int(d.Minutes())
-	seconds := int(d.Seconds()) % 60
-	return fmt.Sprintf("%d:%02d", minutes, seconds)
+func getArtistNames(authors []*types.Author) string {
+	if len(authors) == 0 {
+		return "Unknown Artist"
+	}
+	names := make([]string, 0, len(authors))
+	for _, author := range authors {
+		if author != nil && author.Name != "" {
+			names = append(names, author.Name)
+		}
+	}
+	if len(names) == 0 {
+		return "Unknown Artist"
+	}
+	return strings.Join(names, ", ")
+}
+
+func getFirstAuthor(s *types.Song) string {
+	if len(s.Authors) > 0 && s.Authors[0] != nil {
+		return strings.ToLower(s.Authors[0].Name)
+	}
+	return ""
 }

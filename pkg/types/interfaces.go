@@ -8,6 +8,7 @@ import (
 	"fyne.io/fyne/v2"
 )
 
+// APIClient defines the interface for interacting with the music API
 type APIClient interface {
 	Authenticate(ctx context.Context, token string) error
 	GetSongs(ctx context.Context, page int, search string) (*SongListResponse, error)
@@ -27,6 +28,7 @@ type APIClient interface {
 	SearchAll(ctx context.Context, query string) (*SearchResponse, error)
 }
 
+// Storage defines the interface for local data persistence
 type Storage interface {
 	GetSongs(ctx context.Context, limit, offset int) ([]*Song, error)
 	GetSong(ctx context.Context, slug string) (*Song, error)
@@ -53,6 +55,7 @@ type Storage interface {
 	Close() error
 }
 
+// AudioPlayer defines the interface for audio playback control
 type AudioPlayer interface {
 	Play(ctx context.Context, song *Song) error
 	Pause() error
@@ -68,11 +71,13 @@ type AudioPlayer interface {
 	Close() error
 }
 
+// SearchEngine defines the interface for searching music content
 type SearchEngine interface {
 	Search(ctx context.Context, query string, limit int) (*SearchResults, error)
 	FuzzySearch(ctx context.Context, query string, limit int) (*SearchResults, error)
 }
 
+// DownloadManager defines the interface for managing file downloads
 type DownloadManager interface {
 	Download(ctx context.Context, url, destination string) error
 	DownloadSong(ctx context.Context, song *Song) error
@@ -84,6 +89,7 @@ type DownloadManager interface {
 	ClearCompleted()
 }
 
+// SyncManager defines the interface for synchronizing data with remote sources
 type SyncManager interface {
 	Sync(ctx context.Context) error
 	SyncSongs(ctx context.Context) error
@@ -95,12 +101,13 @@ type SyncManager interface {
 	Stop()
 }
 
-// UI Component interfaces
+// View defines the interface for UI components
 type View interface {
 	Container() *fyne.Container
 	Refresh()
 }
 
+// PlayerControl defines the interface for player control components
 type PlayerControl interface {
 	Play()
 	Pause()
@@ -111,7 +118,7 @@ type PlayerControl interface {
 	Seek(time.Duration)
 }
 
-// Download progress tracking
+// DownloadProgress tracks the progress of a file download
 type DownloadProgress struct {
 	URL        string
 	Filename   string
@@ -125,13 +132,19 @@ type DownloadProgress struct {
 	LastUpdate time.Time
 }
 
+// DownloadStatus represents the current status of a download
 type DownloadStatus int
 
 const (
+	// DownloadStatusPending indicates the download is queued but not started
 	DownloadStatusPending DownloadStatus = iota
+	// DownloadStatusDownloading indicates the download is in progress
 	DownloadStatusDownloading
+	// DownloadStatusCompleted indicates the download finished successfully
 	DownloadStatusCompleted
+	// DownloadStatusFailed indicates the download failed
 	DownloadStatusFailed
+	// DownloadStatusCancelled indicates the download was canceled
 	DownloadStatusCancelled
 )
 

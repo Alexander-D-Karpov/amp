@@ -44,6 +44,7 @@ type PlayerBar struct {
 	queue       []*types.Song
 	queueIndex  int
 	compactMode bool
+	breakpoint  float32
 
 	onNext     func()
 	onPrevious func()
@@ -78,6 +79,7 @@ func NewPlayerBar(player *audio.Player, storage *storage.Database) *PlayerBar {
 		storage:    storage,
 		queue:      make([]*types.Song, 0),
 		queueIndex: -1,
+		breakpoint: 800.0,
 	}
 
 	pb.setupWidgets()
@@ -97,13 +99,10 @@ func (pb *PlayerBar) setupWidgets() {
 
 	pb.prevBtn = widget.NewButtonWithIcon("", theme.MediaSkipPreviousIcon(), pb.previousSong)
 	pb.nextBtn = widget.NewButtonWithIcon("", theme.MediaSkipNextIcon(), pb.nextSong)
-
 	pb.shuffleBtn = widget.NewButtonWithIcon("", theme.MediaReplayIcon(), pb.toggleShuffle)
 	pb.shuffleBtn.Importance = widget.LowImportance
-
 	pb.repeatBtn = widget.NewButtonWithIcon("", theme.MediaReplayIcon(), pb.toggleRepeat)
 	pb.repeatBtn.Importance = widget.LowImportance
-
 	pb.likeBtn = widget.NewButtonWithIcon("", theme.VisibilityOffIcon(), pb.toggleLike)
 	pb.likeBtn.Importance = widget.LowImportance
 
@@ -116,11 +115,17 @@ func (pb *PlayerBar) setupWidgets() {
 	pb.volumeBar.OnChanged = pb.onVolumeChange
 
 	pb.timeLabel = widget.NewLabel("0:00 / 0:00")
+	pb.timeLabel.TextStyle = fyne.TextStyle{Monospace: true}
+
 	pb.songLabel = widget.NewLabel("No song playing")
 	pb.songLabel.TextStyle = fyne.TextStyle{Bold: true}
+	pb.songLabel.Truncation = fyne.TextTruncateEllipsis
+
 	pb.artistLabel = widget.NewLabel("")
+	pb.artistLabel.Truncation = fyne.TextTruncateEllipsis
 
 	pb.coverImg = widget.NewIcon(theme.MediaMusicIcon())
+
 	pb.volumeIcon = widget.NewIcon(theme.VolumeUpIcon())
 
 	pb.updateRepeatButton()
@@ -128,6 +133,21 @@ func (pb *PlayerBar) setupWidgets() {
 }
 
 func (pb *PlayerBar) setupLayout() {
+	pb.container = container.NewStack()
+	pb.updateLayoutForSize(fyne.NewSize(1200, 100))
+}
+
+func (pb *PlayerBar) updateLayoutForSize(size fyne.Size) {
+	pb.compactMode = size.Width < pb.breakpoint
+
+	if pb.compactMode {
+		pb.setupCompactLayout()
+	} else {
+		pb.setupDesktopLayout()
+	}
+}
+
+func (pb *PlayerBar) setupDesktopLayout() {
 	songInfo := container.NewVBox(
 		pb.songLabel,
 		pb.artistLabel,
@@ -146,15 +166,15 @@ func (pb *PlayerBar) setupLayout() {
 		pb.repeatBtn,
 	)
 
-	timeControls := container.NewBorder(
+	timeSeekContainer := container.NewBorder(
 		nil, nil,
 		pb.timeLabel, nil,
 		pb.seekBar,
 	)
 
 	centerSection := container.NewVBox(
-		playerControls,
-		timeControls,
+		container.NewCenter(playerControls),
+		timeSeekContainer,
 	)
 
 	volumeControls := container.NewBorder(
@@ -163,57 +183,79 @@ func (pb *PlayerBar) setupLayout() {
 		pb.volumeBar,
 	)
 
-	rightSection := container.NewVBox(
-		container.NewHBox(pb.likeBtn),
+	rightSection := container.NewHBox(
+		pb.likeBtn,
 		volumeControls,
 	)
 
-	pb.container = container.NewBorder(
+	content := container.NewBorder(
 		nil, nil,
 		leftSection,
 		rightSection,
 		centerSection,
 	)
+
+	pb.container.Objects = []fyne.CanvasObject{content}
+	pb.container.Refresh()
+}
+
+func (pb *PlayerBar) setupCompactLayout() {
+	songInfo := container.NewVBox(
+		pb.songLabel,
+		pb.artistLabel,
+	)
+
+	playerControls := container.NewHBox(
+		pb.prevBtn,
+		pb.playBtn,
+		pb.nextBtn,
+	)
+
+	topRow := container.NewBorder(
+		nil, nil,
+		container.NewHBox(pb.coverImg, songInfo),
+		container.NewHBox(pb.likeBtn, playerControls),
+		nil,
+	)
+
+	bottomRow := container.NewBorder(
+		nil, nil,
+		pb.timeLabel,
+		pb.volumeIcon,
+		pb.seekBar,
+	)
+
+	content := container.NewVBox(topRow, bottomRow)
+	pb.container.Objects = []fyne.CanvasObject{content}
+	pb.container.Refresh()
 }
 
 func (pb *PlayerBar) SetCompactMode(compact bool) {
 	pb.compactMode = compact
-
 	if compact {
-		songInfo := container.NewHBox(pb.songLabel, widget.NewLabel("-"), pb.artistLabel)
-
-		playerControls := container.NewHBox(
-			pb.prevBtn,
-			pb.playBtn,
-			pb.nextBtn,
-		)
-
-		compactLeft := container.NewVBox(songInfo, pb.seekBar)
-		compactRight := container.NewHBox(pb.likeBtn, pb.volumeIcon)
-
-		pb.container = container.NewBorder(
-			nil, nil,
-			compactLeft,
-			compactRight,
-			playerControls,
-		)
+		pb.setupCompactLayout()
 	} else {
-		pb.setupLayout()
+		pb.setupDesktopLayout()
 	}
+}
 
-	pb.container.Refresh()
+func (pb *PlayerBar) Resize(size fyne.Size) {
+	pb.updateLayoutForSize(size)
+	pb.container.Resize(size)
 }
 
 func (pb *PlayerBar) setupEventHandlers() {
 	pb.player.OnPositionChanged(func(position time.Duration) {
-		duration := pb.player.GetDuration()
-		if duration > 0 {
-			progress := float64(position) / float64(duration) * 100
-			pb.seekBar.SetValue(progress)
-			pb.timeLabel.SetText(fmt.Sprintf("%s / %s",
-				formatDuration(position),
-				formatDuration(duration)))
-		}
+		fyne.Do(func() {
+			duration := pb.player.GetDuration()
+			if duration > 0 {
+				progress := float64(position) / float64(duration) * 100
+				pb.seekBar.SetValue(progress)
+				pb.timeLabel.SetText(fmt.Sprintf("%s / %s",
+					formatDuration(position),
+					formatDuration(duration)))
+			}
+		})
 	})
 
 	pb.player.OnFinished(func() {
@@ -224,7 +266,9 @@ func (pb *PlayerBar) setupEventHandlers() {
 func (pb *PlayerBar) togglePlay() {
 	if pb.isPlaying {
 		_ = pb.player.Pause()
-		pb.playBtn.SetIcon(theme.MediaPlayIcon())
+		fyne.Do(func() {
+			pb.playBtn.SetIcon(theme.MediaPlayIcon())
+		})
 		pb.isPlaying = false
 	} else {
 		if pb.currentSong == nil && len(pb.queue) > 0 {
@@ -232,7 +276,9 @@ func (pb *PlayerBar) togglePlay() {
 			pb.queueIndex = 0
 		} else {
 			_ = pb.player.Resume()
-			pb.playBtn.SetIcon(theme.MediaPauseIcon())
+			fyne.Do(func() {
+				pb.playBtn.SetIcon(theme.MediaPauseIcon())
+			})
 			pb.isPlaying = true
 		}
 	}
@@ -371,46 +417,54 @@ func (pb *PlayerBar) toggleLike() {
 }
 
 func (pb *PlayerBar) updateShuffleButton() {
-	if pb.isShuffled {
-		pb.shuffleBtn.Importance = widget.MediumImportance
-	} else {
-		pb.shuffleBtn.Importance = widget.LowImportance
-	}
-	pb.shuffleBtn.Refresh()
+	fyne.Do(func() {
+		if pb.isShuffled {
+			pb.shuffleBtn.Importance = widget.MediumImportance
+		} else {
+			pb.shuffleBtn.Importance = widget.LowImportance
+		}
+		pb.shuffleBtn.Refresh()
+	})
 }
 
 func (pb *PlayerBar) updateRepeatButton() {
-	switch pb.repeatMode {
-	case RepeatOff:
-		pb.repeatBtn.SetIcon(theme.MediaReplayIcon())
-		pb.repeatBtn.Importance = widget.LowImportance
-	case RepeatAll:
-		pb.repeatBtn.SetIcon(theme.MediaReplayIcon())
-		pb.repeatBtn.Importance = widget.MediumImportance
-	case RepeatOne:
-		pb.repeatBtn.SetIcon(theme.MediaReplayIcon())
-		pb.repeatBtn.Importance = widget.HighImportance
-	}
-	pb.repeatBtn.Refresh()
+	fyne.Do(func() {
+		switch pb.repeatMode {
+		case RepeatOff:
+			pb.repeatBtn.SetIcon(theme.MediaReplayIcon())
+			pb.repeatBtn.Importance = widget.LowImportance
+		case RepeatAll:
+			pb.repeatBtn.SetIcon(theme.MediaReplayIcon())
+			pb.repeatBtn.Importance = widget.MediumImportance
+		case RepeatOne:
+			pb.repeatBtn.SetIcon(theme.MediaReplayIcon())
+			pb.repeatBtn.Importance = widget.HighImportance
+		}
+		pb.repeatBtn.Refresh()
+	})
 }
 
 func (pb *PlayerBar) updateLikeButton() {
-	if pb.currentSong != nil && pb.currentSong.Liked != nil && *pb.currentSong.Liked {
-		pb.likeBtn.SetIcon(theme.ConfirmIcon())
-		pb.likeBtn.Importance = widget.MediumImportance
-	} else {
-		pb.likeBtn.SetIcon(theme.VisibilityOffIcon())
-		pb.likeBtn.Importance = widget.LowImportance
-	}
-	pb.likeBtn.Refresh()
+	fyne.Do(func() {
+		if pb.currentSong != nil && pb.currentSong.Liked != nil && *pb.currentSong.Liked {
+			pb.likeBtn.SetIcon(theme.ConfirmIcon())
+			pb.likeBtn.Importance = widget.MediumImportance
+		} else {
+			pb.likeBtn.SetIcon(theme.VisibilityOffIcon())
+			pb.likeBtn.Importance = widget.LowImportance
+		}
+		pb.likeBtn.Refresh()
+	})
 }
 
 func (pb *PlayerBar) onSeek(value float64) {
 	duration := pb.player.GetDuration()
 	position := time.Duration(float64(duration) * value / 100)
-	pb.timeLabel.SetText(fmt.Sprintf("%s / %s",
-		formatDuration(position),
-		formatDuration(duration)))
+	fyne.Do(func() {
+		pb.timeLabel.SetText(fmt.Sprintf("%s / %s",
+			formatDuration(position),
+			formatDuration(duration)))
+	})
 }
 
 func (pb *PlayerBar) onSeekEnded(value float64) {
@@ -422,13 +476,15 @@ func (pb *PlayerBar) onSeekEnded(value float64) {
 func (pb *PlayerBar) onVolumeChange(value float64) {
 	_ = pb.player.SetVolume(value / 100)
 
-	if value == 0 {
-		pb.volumeIcon.SetResource(theme.VolumeDownIcon())
-	} else if value < 50 {
-		pb.volumeIcon.SetResource(theme.VolumeDownIcon())
-	} else {
-		pb.volumeIcon.SetResource(theme.VolumeUpIcon())
-	}
+	fyne.Do(func() {
+		if value == 0 {
+			pb.volumeIcon.SetResource(theme.VolumeDownIcon())
+		} else if value < 50 {
+			pb.volumeIcon.SetResource(theme.VolumeDownIcon())
+		} else {
+			pb.volumeIcon.SetResource(theme.VolumeUpIcon())
+		}
+	})
 }
 
 func (pb *PlayerBar) playSong(song *types.Song) {
@@ -439,28 +495,34 @@ func (pb *PlayerBar) playSong(song *types.Song) {
 	}
 
 	pb.SetCurrentSong(song)
-	pb.playBtn.SetIcon(theme.MediaPauseIcon())
+	fyne.Do(func() {
+		pb.playBtn.SetIcon(theme.MediaPauseIcon())
+	})
 	pb.isPlaying = true
 }
 
 func (pb *PlayerBar) stop() {
 	_ = pb.player.Stop()
-	pb.playBtn.SetIcon(theme.MediaPlayIcon())
+	fyne.Do(func() {
+		pb.playBtn.SetIcon(theme.MediaPlayIcon())
+		pb.timeLabel.SetText("0:00 / 0:00")
+		pb.seekBar.SetValue(0)
+	})
 	pb.isPlaying = false
-	pb.timeLabel.SetText("0:00 / 0:00")
-	pb.seekBar.SetValue(0)
 }
 
 func (pb *PlayerBar) SetCurrentSong(song *types.Song) {
 	pb.currentSong = song
-	if song != nil {
-		pb.songLabel.SetText(song.Name)
-		pb.artistLabel.SetText(getArtistNames(song.Authors))
-		pb.updateLikeButton()
-	} else {
-		pb.songLabel.SetText("No song playing")
-		pb.artistLabel.SetText("")
-	}
+	fyne.Do(func() {
+		if song != nil {
+			pb.songLabel.SetText(song.Name)
+			pb.artistLabel.SetText(getArtistNames(song.Authors))
+			pb.updateLikeButton()
+		} else {
+			pb.songLabel.SetText("No song playing")
+			pb.artistLabel.SetText("")
+		}
+	})
 }
 
 func (pb *PlayerBar) SetQueue(songs []*types.Song, startIndex int) {

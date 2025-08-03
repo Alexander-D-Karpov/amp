@@ -11,22 +11,40 @@ import (
 	"github.com/Alexander-D-Karpov/amp/pkg/types"
 )
 
-// Engine provides fuzzy search capabilities for music content
-type Engine struct {
+// SearchEngine provides comprehensive search functionality for music content
+type SearchEngine struct {
 	cfg     *config.Config
 	storage types.Storage
 }
 
-// NewEngine creates a new fuzzy search engine instance
-func NewEngine(cfg *config.Config, storage types.Storage) *Engine {
-	return &Engine{
+// ScoredSong represents a song with a search relevance score
+type ScoredSong struct {
+	Song  *types.Song
+	Score float64
+}
+
+// ScoredAlbum represents an album with a search relevance score
+type ScoredAlbum struct {
+	Album *types.Album
+	Score float64
+}
+
+// ScoredAuthor represents an author with a search relevance score
+type ScoredAuthor struct {
+	Author *types.Author
+	Score  float64
+}
+
+// NewSearchEngine creates a new search engine instance
+func NewSearchEngine(cfg *config.Config, storage types.Storage) *SearchEngine {
+	return &SearchEngine{
 		cfg:     cfg,
 		storage: storage,
 	}
 }
 
-// Search performs a search operation with fuzzy matching fallback
-func (e *Engine) Search(ctx context.Context, query string, limit int) (*types.SearchResults, error) {
+// Search performs a comprehensive search across all content types
+func (e *SearchEngine) Search(ctx context.Context, query string, limit int) (*types.SearchResults, error) {
 	if query == "" {
 		return &types.SearchResults{}, nil
 	}
@@ -53,8 +71,8 @@ func (e *Engine) Search(ctx context.Context, query string, limit int) (*types.Se
 	return results, nil
 }
 
-// FuzzySearch performs fuzzy text matching across all music content types
-func (e *Engine) FuzzySearch(ctx context.Context, query string, limit int) (*types.SearchResults, error) {
+// FuzzySearch performs fuzzy matching across all music content
+func (e *SearchEngine) FuzzySearch(ctx context.Context, query string, limit int) (*types.SearchResults, error) {
 	songs, err := e.storage.GetSongs(ctx, 1000, 0)
 	if err != nil {
 		return nil, err
@@ -84,7 +102,7 @@ func (e *Engine) FuzzySearch(ctx context.Context, query string, limit int) (*typ
 	return results, nil
 }
 
-func (e *Engine) fuzzySearchSongs(songs []*types.Song, query string) []*types.Song {
+func (e *SearchEngine) fuzzySearchSongs(songs []*types.Song, query string) []*types.Song {
 	var scored []ScoredSong
 	queryLower := strings.ToLower(query)
 
@@ -129,7 +147,7 @@ func (e *Engine) fuzzySearchSongs(songs []*types.Song, query string) []*types.So
 	return result
 }
 
-func (e *Engine) fuzzySearchAlbums(albums []*types.Album, query string) []*types.Album {
+func (e *SearchEngine) fuzzySearchAlbums(albums []*types.Album, query string) []*types.Album {
 	var scored []ScoredAlbum
 	queryLower := strings.ToLower(query)
 
@@ -162,7 +180,7 @@ func (e *Engine) fuzzySearchAlbums(albums []*types.Album, query string) []*types
 	return result
 }
 
-func (e *Engine) fuzzySearchAuthors(authors []*types.Author, query string) []*types.Author {
+func (e *SearchEngine) fuzzySearchAuthors(authors []*types.Author, query string) []*types.Author {
 	var scored []ScoredAuthor
 	queryLower := strings.ToLower(query)
 
@@ -190,6 +208,27 @@ func (e *Engine) fuzzySearchAuthors(authors []*types.Author, query string) []*ty
 	result := make([]*types.Author, 0, len(scored))
 	for _, s := range scored {
 		result = append(result, s.Author)
+	}
+
+	return result
+}
+
+func mergeSongs(songs1, songs2 []*types.Song) []*types.Song {
+	seen := make(map[string]bool)
+	var result []*types.Song
+
+	for _, song := range songs1 {
+		if !seen[song.Slug] {
+			result = append(result, song)
+			seen[song.Slug] = true
+		}
+	}
+
+	for _, song := range songs2 {
+		if !seen[song.Slug] {
+			result = append(result, song)
+			seen[song.Slug] = true
+		}
 	}
 
 	return result

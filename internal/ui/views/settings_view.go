@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"strconv"
 
 	"fyne.io/fyne/v2"
@@ -354,7 +355,11 @@ func (sv *SettingsView) exportSettings() {
 		if err != nil || writer == nil {
 			return
 		}
-		defer writer.Close()
+		defer func() {
+			if closeErr := writer.Close(); closeErr != nil {
+				log.Printf("Failed to close file writer: %v", closeErr)
+			}
+		}()
 
 		data, err := json.MarshalIndent(sv.cfg, "", "  ")
 		if err != nil {
@@ -376,7 +381,11 @@ func (sv *SettingsView) importSettings() {
 		if err != nil || reader == nil {
 			return
 		}
-		defer reader.Close()
+		defer func() {
+			if closeErr := reader.Close(); closeErr != nil {
+				log.Printf("Failed to close file reader: %v", closeErr)
+			}
+		}()
 
 		data, err := io.ReadAll(reader)
 		if err != nil {
@@ -401,9 +410,16 @@ func (sv *SettingsView) saveConfigToFile() error {
 }
 
 func (sv *SettingsView) cloneConfig(cfg *config.Config) *config.Config {
-	data, _ := json.Marshal(cfg)
+	data, err := json.Marshal(cfg)
+	if err != nil {
+		log.Printf("Failed to marshal config for cloning: %v", err)
+		return cfg
+	}
 	var clone config.Config
-	json.Unmarshal(data, &clone)
+	if err := json.Unmarshal(data, &clone); err != nil {
+		log.Printf("Failed to unmarshal config for cloning: %v", err)
+		return cfg
+	}
 	return &clone
 }
 

@@ -14,6 +14,7 @@ import (
 	"github.com/Alexander-D-Karpov/amp/pkg/types"
 )
 
+// SyncManager handles synchronization between local storage and remote API
 type SyncManager struct {
 	api     *api.Client
 	storage *Database
@@ -31,6 +32,7 @@ type SyncManager struct {
 	debug bool
 }
 
+// SyncStats contains statistics about a synchronization operation
 type SyncStats struct {
 	SongsTotal      int
 	SongsSynced     int
@@ -46,6 +48,7 @@ type SyncStats struct {
 	Errors          []string
 }
 
+// NewSyncManager creates a new sync manager with the given dependencies
 func NewSyncManager(api *api.Client, storage *Database, cfg *config.Config) *SyncManager {
 	return &SyncManager{
 		api:     api,
@@ -85,6 +88,7 @@ func extractPageFromURL(urlStr string) int {
 	return page
 }
 
+// Start begins the synchronization process with periodic updates
 func (sm *SyncManager) Start(ctx context.Context) {
 	sm.mu.Lock()
 	if sm.running {
@@ -135,6 +139,7 @@ func (sm *SyncManager) Start(ctx context.Context) {
 	}()
 }
 
+// Stop halts the synchronization process
 func (sm *SyncManager) Stop() {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
@@ -150,6 +155,7 @@ func (sm *SyncManager) Stop() {
 	}
 }
 
+// FullSync performs a complete synchronization of all data
 func (sm *SyncManager) FullSync(ctx context.Context) error {
 	if sm.api.IsAnonymous() {
 		sm.debugLog("Skipping sync - running in anonymous mode")
@@ -465,7 +471,11 @@ func (sm *SyncManager) syncPlayHistory(ctx context.Context, stats *SyncStats) er
 	if err != nil {
 		return fmt.Errorf("query unsynced play history: %w", err)
 	}
-	defer rows.Close()
+	defer func() {
+		if closeErr := rows.Close(); closeErr != nil {
+			sm.debugLog("Failed to close rows: %v", closeErr)
+		}
+	}()
 
 	var toSync []types.PlayHistory
 	for rows.Next() {
@@ -543,36 +553,42 @@ func (sm *SyncManager) syncUserPreferences(ctx context.Context, stats *SyncStats
 	return nil
 }
 
+// ForceSyncSongs performs a forced synchronization of songs only
 func (sm *SyncManager) ForceSyncSongs(ctx context.Context) error {
 	sm.debugLog("Force syncing songs...")
 	stats := &SyncStats{StartTime: time.Now(), Errors: make([]string, 0)}
 	return sm.syncSongs(ctx, stats)
 }
 
+// ForceSyncAlbums performs a forced synchronization of albums only
 func (sm *SyncManager) ForceSyncAlbums(ctx context.Context) error {
 	sm.debugLog("Force syncing albums...")
 	stats := &SyncStats{StartTime: time.Now(), Errors: make([]string, 0)}
 	return sm.syncAlbums(ctx, stats)
 }
 
+// ForceSyncAuthors performs a forced synchronization of authors only
 func (sm *SyncManager) ForceSyncAuthors(ctx context.Context) error {
 	sm.debugLog("Force syncing authors...")
 	stats := &SyncStats{StartTime: time.Now(), Errors: make([]string, 0)}
 	return sm.syncAuthors(ctx, stats)
 }
 
+// ForceSyncPlaylists performs a forced synchronization of playlists only
 func (sm *SyncManager) ForceSyncPlaylists(ctx context.Context) error {
 	sm.debugLog("Force syncing playlists...")
 	stats := &SyncStats{StartTime: time.Now(), Errors: make([]string, 0)}
 	return sm.syncPlaylists(ctx, stats)
 }
 
+// IsRunning returns true if the sync manager is currently running
 func (sm *SyncManager) IsRunning() bool {
 	sm.mu.RLock()
 	defer sm.mu.RUnlock()
 	return sm.running
 }
 
+// SetInterval updates the sync interval
 func (sm *SyncManager) SetInterval(interval time.Duration) {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
@@ -587,18 +603,22 @@ func (sm *SyncManager) SetInterval(interval time.Duration) {
 	sm.debugLog("Sync interval updated to: %v", interval)
 }
 
+// OnProgress sets the progress callback
 func (sm *SyncManager) OnProgress(callback func(string, int, int)) {
 	sm.onProgress = callback
 }
 
+// OnError sets the error callback
 func (sm *SyncManager) OnError(callback func(error)) {
 	sm.onError = callback
 }
 
+// OnComplete sets the completion callback
 func (sm *SyncManager) OnComplete(callback func()) {
 	sm.onComplete = callback
 }
 
+// GetLastSyncTime returns the timestamp of the last successful sync
 func (sm *SyncManager) GetLastSyncTime() time.Time {
 	query := "SELECT MAX(last_sync) FROM (SELECT last_sync FROM songs UNION SELECT last_sync FROM albums UNION SELECT last_sync FROM authors UNION SELECT last_sync FROM playlists)"
 
@@ -612,6 +632,7 @@ func (sm *SyncManager) GetLastSyncTime() time.Time {
 	return lastSync
 }
 
+// GetSyncStats returns current synchronization statistics
 func (sm *SyncManager) GetSyncStats() *SyncStats {
 	stats := &SyncStats{
 		LastSync: sm.GetLastSyncTime(),

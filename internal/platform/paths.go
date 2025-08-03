@@ -6,20 +6,27 @@ import (
 	"runtime"
 )
 
+const (
+	osWindows = "windows"
+	osDarwin  = "darwin"
+	osAndroid = "android"
+)
+
+// GetDataDir returns the platform-specific data directory for AMP
 func GetDataDir() (string, error) {
 	switch runtime.GOOS {
-	case "windows":
+	case osWindows:
 		if appData := os.Getenv("APPDATA"); appData != "" {
 			return filepath.Join(appData, "AMP"), nil
 		}
 		return filepath.Join(os.Getenv("USERPROFILE"), "AppData", "Roaming", "AMP"), nil
-	case "darwin":
+	case osDarwin:
 		home, err := os.UserHomeDir()
 		if err != nil {
 			return "", err
 		}
 		return filepath.Join(home, "Library", "Application Support", "AMP"), nil
-	case "android":
+	case osAndroid:
 		if androidData := os.Getenv("ANDROID_DATA"); androidData != "" {
 			return filepath.Join(androidData, "data", "ru.akarpov.amp", "files"), nil
 		}
@@ -36,20 +43,21 @@ func GetDataDir() (string, error) {
 	}
 }
 
+// GetCacheDir returns the platform-specific cache directory for AMP
 func GetCacheDir() (string, error) {
 	switch runtime.GOOS {
-	case "windows":
+	case osWindows:
 		if localAppData := os.Getenv("LOCALAPPDATA"); localAppData != "" {
 			return filepath.Join(localAppData, "AMP", "Cache"), nil
 		}
 		return filepath.Join(os.Getenv("USERPROFILE"), "AppData", "Local", "AMP", "Cache"), nil
-	case "darwin":
+	case osDarwin:
 		home, err := os.UserHomeDir()
 		if err != nil {
 			return "", err
 		}
 		return filepath.Join(home, "Library", "Caches", "AMP"), nil
-	case "android":
+	case osAndroid:
 		if androidData := os.Getenv("ANDROID_DATA"); androidData != "" {
 			return filepath.Join(androidData, "data", "ru.akarpov.amp", "cache"), nil
 		}
@@ -66,20 +74,21 @@ func GetCacheDir() (string, error) {
 	}
 }
 
+// GetConfigDir returns the platform-specific configuration directory for AMP
 func GetConfigDir() (string, error) {
 	switch runtime.GOOS {
-	case "windows":
+	case osWindows:
 		if appData := os.Getenv("APPDATA"); appData != "" {
 			return filepath.Join(appData, "AMP"), nil
 		}
 		return filepath.Join(os.Getenv("USERPROFILE"), "AppData", "Roaming", "AMP"), nil
-	case "darwin":
+	case osDarwin:
 		home, err := os.UserHomeDir()
 		if err != nil {
 			return "", err
 		}
 		return filepath.Join(home, "Library", "Preferences", "AMP"), nil
-	case "android":
+	case osAndroid:
 		if androidData := os.Getenv("ANDROID_DATA"); androidData != "" {
 			return filepath.Join(androidData, "data", "ru.akarpov.amp", "files"), nil
 		}
