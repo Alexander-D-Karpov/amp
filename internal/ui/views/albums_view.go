@@ -51,7 +51,7 @@ func NewAlbumsView(musicService *services.MusicService, imageService *services.I
 		musicService:   musicService,
 		imageService:   imageService,
 		handlers:       handlers,
-		debug:          debug,
+		debug:          false, // Reduced debug logging
 		albums:         make([]*types.Album, 0),
 		filteredAlbums: make([]*types.Album, 0),
 		searchCache:    make(map[string][]*types.Album),
@@ -123,10 +123,6 @@ func (av *AlbumsView) performSearch(query string) {
 	av.hasMore = true
 	av.mu.Unlock()
 
-	if av.debug {
-		log.Printf("[ALBUMS_VIEW] Performing search for: '%s'", query)
-	}
-
 	if query == "" {
 		av.loadAlbums()
 		return
@@ -174,20 +170,12 @@ func (av *AlbumsView) loadAlbumsWithSearch(query string) {
 		}()
 
 		ctx := context.Background()
-
 		albums, hasMore, err := av.musicService.GetAlbums(ctx, 1, query)
 		if err != nil {
-			if av.debug {
-				log.Printf("[ALBUMS_VIEW] Error searching albums: %v", err)
-			}
 			fyne.Do(func() {
 				av.statusLabel.SetText(fmt.Sprintf("Search error: %v", err))
 			})
 			return
-		}
-
-		if av.debug {
-			log.Printf("[ALBUMS_VIEW] Search returned %d albums", len(albums))
 		}
 
 		av.mu.Lock()
@@ -236,24 +224,12 @@ func (av *AlbumsView) loadAlbums() {
 		}()
 
 		ctx := context.Background()
-
-		if av.debug {
-			log.Printf("[ALBUMS_VIEW] Loading albums - query: '%s'", query)
-		}
-
 		albums, hasMore, err := av.musicService.GetAlbums(ctx, 1, query)
 		if err != nil {
-			if av.debug {
-				log.Printf("[ALBUMS_VIEW] Error loading albums: %v", err)
-			}
 			fyne.Do(func() {
 				av.statusLabel.SetText(fmt.Sprintf("Error: %v", err))
 			})
 			return
-		}
-
-		if av.debug {
-			log.Printf("[ALBUMS_VIEW] Loaded %d albums from service", len(albums))
 		}
 
 		av.mu.Lock()
@@ -297,10 +273,6 @@ func (av *AlbumsView) applySortAndFilter() {
 		}
 		return false
 	})
-
-	if av.debug {
-		log.Printf("[ALBUMS_VIEW] Applied sort '%s', result: %d albums", sortOpt, len(av.filteredAlbums))
-	}
 }
 
 func (av *AlbumsView) updateGridView() {
@@ -326,9 +298,6 @@ func (av *AlbumsView) updateGridView() {
 		for i, album := range albums {
 			if album != nil {
 				items[i] = components.MediaItemFromAlbum(album)
-				if av.debug && i < 5 {
-					log.Printf("[ALBUMS_VIEW] Added album to grid: %s", album.Name)
-				}
 			}
 		}
 	}
@@ -348,10 +317,6 @@ func (av *AlbumsView) SetCompactMode(compact bool) {
 }
 
 func (av *AlbumsView) Refresh() {
-	if av.debug {
-		log.Printf("[ALBUMS_VIEW] Manual refresh requested")
-	}
-
 	av.mu.Lock()
 	av.currentPage = 1
 	av.hasMore = true

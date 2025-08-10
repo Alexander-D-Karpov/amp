@@ -27,7 +27,7 @@ func NewUIHandlers(musicService *services.MusicService, imageService *services.I
 		musicService:    musicService,
 		imageService:    imageService,
 		downloadManager: downloadManager,
-		debug:           debug,
+		debug:           false, // Reduced debug logging
 	}
 }
 
@@ -52,20 +52,15 @@ func (h *UIHandlers) HandleSongSelection(song *types.Song, playlist []*types.Son
 		h.onSongSelected(song, playlist)
 	}
 
-	isDownloaded := song.Downloaded
-	if song.LocalPath != nil && *song.LocalPath != "" {
-		if _, err := os.Stat(*song.LocalPath); err == nil {
-			isDownloaded = true
-		}
-	}
-
-	if isDownloaded {
+	// Check if song is already available locally
+	if h.isLocallyAvailable(song) {
 		if h.debug {
-			log.Printf("[UI_HANDLERS] Song '%s' already exists locally.", song.Name)
+			log.Printf("[UI_HANDLERS] Song '%s' is available locally", song.Name)
 		}
 		return
 	}
 
+	// Start background download for streaming songs
 	go func() {
 		if h.debug {
 			log.Printf("[UI_HANDLERS] Starting background download for: %s", song.Name)
@@ -76,6 +71,24 @@ func (h *UIHandlers) HandleSongSelection(song *types.Song, playlist []*types.Son
 			}
 		}
 	}()
+}
+
+func (h *UIHandlers) isLocallyAvailable(song *types.Song) bool {
+	// Check if already marked as downloaded
+	if song.Downloaded {
+		return true
+	}
+
+	// Check if local path exists and file is accessible
+	if song.LocalPath != nil && *song.LocalPath != "" {
+		if stat, err := os.Stat(*song.LocalPath); err == nil && stat.Size() > 0 {
+			// Update the song record to mark as downloaded
+			song.Downloaded = true
+			return true
+		}
+	}
+
+	return false
 }
 
 func (h *UIHandlers) HandleAlbumSelection(album *types.Album) {
@@ -103,4 +116,9 @@ func (h *UIHandlers) HandlePlaylistSelection(playlist *types.Playlist) {
 	if len(playlist.Songs) > 0 && h.onSongSelected != nil {
 		h.onSongSelected(playlist.Songs[0], playlist.Songs)
 	}
+}
+
+// SetDebug enables or disables debug logging
+func (h *UIHandlers) SetDebug(debug bool) {
+	h.debug = debug
 }

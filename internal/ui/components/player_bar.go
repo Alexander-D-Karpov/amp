@@ -4,10 +4,14 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"strings"
 	"time"
 
 	"fyne.io/fyne/v2"
+	"fyne.io/fyne/v2/canvas"
 	"fyne.io/fyne/v2/container"
+	"fyne.io/fyne/v2/dialog"
+	"fyne.io/fyne/v2/layout"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 
@@ -22,20 +26,23 @@ type PlayerBar struct {
 	storage *storage.Database
 	cfg     *config.Config
 
-	container   *fyne.Container
-	playBtn     *widget.Button
-	prevBtn     *widget.Button
-	nextBtn     *widget.Button
-	shuffleBtn  *widget.Button
-	repeatBtn   *widget.Button
-	likeBtn     *widget.Button
-	seekBar     *widget.Slider
-	volumeBar   *widget.Slider
-	timeLabel   *widget.Label
-	songLabel   *widget.Label
-	artistLabel *widget.Label
-	coverImg    *widget.Icon
-	volumeIcon  *widget.Icon
+	container      *fyne.Container
+	playBtn        *widget.Button
+	prevBtn        *widget.Button
+	nextBtn        *widget.Button
+	shuffleBtn     *widget.Button
+	repeatBtn      *widget.Button
+	likeBtn        *widget.Button
+	seekBar        *widget.Slider
+	bufferProgress *widget.ProgressBar
+	waveformCanvas *canvas.Image
+	volumeBar      *widget.Slider
+	volumeBtn      *widget.Button
+	timeLabel      *widget.Label
+	songLabel      *widget.Label
+	artistLabel    *widget.Label
+	coverImg       *widget.Icon
+	volumeDialog   dialog.Dialog
 
 	currentSong *types.Song
 	isPlaying   bool
@@ -46,10 +53,15 @@ type PlayerBar struct {
 	compactMode bool
 	breakpoint  float32
 
-	onNext     func()
-	onPrevious func()
-	onShuffle  func(bool)
-	onRepeat   func(RepeatMode)
+	onNext                  func()
+	onPrevious              func()
+	onShuffle               func(bool)
+	onRepeat                func(RepeatMode)
+	seekingProgrammatically bool
+	userSeeking             bool
+	parentWindow            fyne.Window
+	lastPosition            time.Duration
+	lastDuration            time.Duration
 }
 
 type RepeatMode int
@@ -93,6 +105,10 @@ func (pb *PlayerBar) SetConfig(cfg *config.Config) {
 	pb.cfg = cfg
 }
 
+func (pb *PlayerBar) SetParentWindow(window fyne.Window) {
+	pb.parentWindow = window
+}
+
 func (pb *PlayerBar) setupWidgets() {
 	pb.playBtn = widget.NewButtonWithIcon("", theme.MediaPlayIcon(), pb.togglePlay)
 	pb.playBtn.Importance = widget.HighImportance
@@ -107,12 +123,18 @@ func (pb *PlayerBar) setupWidgets() {
 	pb.likeBtn.Importance = widget.LowImportance
 
 	pb.seekBar = widget.NewSlider(0, 100)
-	pb.seekBar.OnChanged = pb.onSeek
+	pb.seekBar.OnChanged = pb.onSeekChanged
 	pb.seekBar.OnChangeEnded = pb.onSeekEnded
+
+	pb.bufferProgress = widget.NewProgressBar()
+	pb.bufferProgress.Hide()
 
 	pb.volumeBar = widget.NewSlider(0, 100)
 	pb.volumeBar.SetValue(70)
 	pb.volumeBar.OnChanged = pb.onVolumeChange
+
+	pb.volumeBtn = widget.NewButtonWithIcon("", theme.VolumeUpIcon(), pb.showVolumeDialog)
+	pb.volumeBtn.Importance = widget.LowImportance
 
 	pb.timeLabel = widget.NewLabel("0:00 / 0:00")
 	pb.timeLabel.TextStyle = fyne.TextStyle{Monospace: true}
@@ -125,8 +147,6 @@ func (pb *PlayerBar) setupWidgets() {
 	pb.artistLabel.Truncation = fyne.TextTruncateEllipsis
 
 	pb.coverImg = widget.NewIcon(theme.MediaMusicIcon())
-
-	pb.volumeIcon = widget.NewIcon(theme.VolumeUpIcon())
 
 	pb.updateRepeatButton()
 	pb.updateShuffleButton()
@@ -154,9 +174,11 @@ func (pb *PlayerBar) setupDesktopLayout() {
 	)
 
 	leftSection := container.NewHBox(
-		pb.coverImg,
+		container.NewPadded(pb.coverImg),
 		songInfo,
 	)
+	leftSection = container.NewWithoutLayout(leftSection)
+	leftSection.Resize(fyne.NewSize(300, 80))
 
 	playerControls := container.NewHBox(
 		pb.shuffleBtn,
@@ -166,10 +188,15 @@ func (pb *PlayerBar) setupDesktopLayout() {
 		pb.repeatBtn,
 	)
 
+	seekContainer := container.NewStack(
+		pb.bufferProgress,
+		pb.seekBar,
+	)
+
 	timeSeekContainer := container.NewBorder(
 		nil, nil,
 		pb.timeLabel, nil,
-		pb.seekBar,
+		seekContainer,
 	)
 
 	centerSection := container.NewVBox(
@@ -179,9 +206,11 @@ func (pb *PlayerBar) setupDesktopLayout() {
 
 	volumeControls := container.NewBorder(
 		nil, nil,
-		pb.volumeIcon, nil,
+		pb.volumeBtn, nil,
 		pb.volumeBar,
 	)
+	volumeControls = container.NewWithoutLayout(volumeControls)
+	volumeControls.Resize(fyne.NewSize(150, 40))
 
 	rightSection := container.NewHBox(
 		pb.likeBtn,
@@ -200,34 +229,68 @@ func (pb *PlayerBar) setupDesktopLayout() {
 }
 
 func (pb *PlayerBar) setupCompactLayout() {
+	topControls := container.NewHBox(
+		pb.prevBtn,
+		pb.playBtn,
+		pb.nextBtn,
+		layout.NewSpacer(),
+		pb.likeBtn,
+		pb.volumeBtn,
+	)
+
 	songInfo := container.NewVBox(
 		pb.songLabel,
 		pb.artistLabel,
 	)
 
-	playerControls := container.NewHBox(
-		pb.prevBtn,
-		pb.playBtn,
-		pb.nextBtn,
-	)
-
-	topRow := container.NewBorder(
-		nil, nil,
-		container.NewHBox(pb.coverImg, songInfo),
-		container.NewHBox(pb.likeBtn, playerControls),
-		nil,
+	seekContainer := container.NewStack(
+		pb.bufferProgress,
+		pb.seekBar,
 	)
 
 	bottomRow := container.NewBorder(
 		nil, nil,
-		pb.timeLabel,
-		pb.volumeIcon,
-		pb.seekBar,
+		pb.timeLabel, nil,
+		seekContainer,
 	)
 
-	content := container.NewVBox(topRow, bottomRow)
+	content := container.NewVBox(
+		topControls,
+		songInfo,
+		bottomRow,
+	)
+
 	pb.container.Objects = []fyne.CanvasObject{content}
 	pb.container.Refresh()
+}
+
+func (pb *PlayerBar) showVolumeDialog() {
+	if pb.parentWindow == nil {
+		return
+	}
+
+	volumeSlider := widget.NewSlider(0, 100)
+	volumeSlider.SetValue(pb.volumeBar.Value)
+	volumeSlider.OnChanged = func(value float64) {
+		pb.volumeBar.SetValue(value)
+		pb.onVolumeChange(value)
+	}
+
+	volumeLabel := widget.NewLabel(fmt.Sprintf("Volume: %.0f%%", pb.volumeBar.Value))
+	volumeSlider.OnChanged = func(value float64) {
+		pb.volumeBar.SetValue(value)
+		pb.onVolumeChange(value)
+		volumeLabel.SetText(fmt.Sprintf("Volume: %.0f%%", value))
+	}
+
+	content := container.NewVBox(
+		volumeLabel,
+		volumeSlider,
+	)
+
+	pb.volumeDialog = dialog.NewCustom("Volume Control", "Close", content, pb.parentWindow)
+	pb.volumeDialog.Resize(fyne.NewSize(300, 150))
+	pb.volumeDialog.Show()
 }
 
 func (pb *PlayerBar) SetCompactMode(compact bool) {
@@ -245,15 +308,32 @@ func (pb *PlayerBar) Resize(size fyne.Size) {
 }
 
 func (pb *PlayerBar) setupEventHandlers() {
-	pb.player.OnPositionChanged(func(position time.Duration) {
+	pb.player.OnPositionChanged(func(pos time.Duration) {
 		fyne.Do(func() {
-			duration := pb.player.GetDuration()
-			if duration > 0 {
-				progress := float64(position) / float64(duration) * 100
+			if pb.userSeeking {
+				return
+			}
+
+			pb.lastPosition = pos
+			dur := pb.player.GetDuration()
+			pb.lastDuration = dur
+
+			if dur > 0 {
+				progress := float64(pos) / float64(dur) * 100
+				pb.seekingProgrammatically = true
 				pb.seekBar.SetValue(progress)
-				pb.timeLabel.SetText(fmt.Sprintf("%s / %s",
-					formatDuration(position),
-					formatDuration(duration)))
+				pb.seekingProgrammatically = false
+				pb.timeLabel.SetText(fmt.Sprintf("%s / %s", formatDuration(pos), formatDuration(dur)))
+			} else {
+				pb.timeLabel.SetText(fmt.Sprintf("%s / --:--", formatDuration(pos)))
+			}
+
+			downloadProgress := pb.player.GetDownloadProgress()
+			if downloadProgress < 1.0 {
+				pb.bufferProgress.SetValue(downloadProgress)
+				pb.bufferProgress.Show()
+			} else {
+				pb.bufferProgress.Hide()
 			}
 		})
 	})
@@ -263,25 +343,66 @@ func (pb *PlayerBar) setupEventHandlers() {
 	})
 }
 
+func (pb *PlayerBar) onSeekChanged(value float64) {
+	if pb.seekingProgrammatically {
+		return
+	}
+
+	pb.userSeeking = true
+
+	if pb.lastDuration > 0 {
+		position := time.Duration(float64(pb.lastDuration) * value / 100)
+		pb.timeLabel.SetText(fmt.Sprintf("%s / %s", formatDuration(position), formatDuration(pb.lastDuration)))
+	}
+}
+
+func (pb *PlayerBar) onSeekEnded(value float64) {
+	pb.userSeeking = false
+
+	if pb.seekingProgrammatically {
+		return
+	}
+
+	if pb.lastDuration > 0 {
+		position := time.Duration(float64(pb.lastDuration) * value / 100)
+		if err := pb.player.Seek(position); err != nil {
+			log.Printf("[PLAYER_BAR] Seek failed: %v", err)
+		}
+	}
+}
+
 func (pb *PlayerBar) togglePlay() {
 	if pb.isPlaying {
-		_ = pb.player.Pause()
-		fyne.Do(func() {
-			pb.playBtn.SetIcon(theme.MediaPlayIcon())
-		})
+		if err := pb.player.Pause(); err != nil {
+			log.Printf("[PLAYER_BAR] Pause failed: %v", err)
+			return
+		}
 		pb.isPlaying = false
+		pb.updatePlayButton()
 	} else {
 		if pb.currentSong == nil && len(pb.queue) > 0 {
 			pb.playSong(pb.queue[0])
 			pb.queueIndex = 0
 		} else {
-			_ = pb.player.Resume()
-			fyne.Do(func() {
-				pb.playBtn.SetIcon(theme.MediaPauseIcon())
-			})
+			if err := pb.player.Resume(); err != nil {
+				log.Printf("[PLAYER_BAR] Resume failed: %v", err)
+				return
+			}
 			pb.isPlaying = true
+			pb.updatePlayButton()
 		}
 	}
+}
+
+func (pb *PlayerBar) updatePlayButton() {
+	fyne.Do(func() {
+		if pb.isPlaying {
+			pb.playBtn.SetIcon(theme.MediaPauseIcon())
+		} else {
+			pb.playBtn.SetIcon(theme.MediaPlayIcon())
+		}
+		pb.playBtn.Refresh()
+	})
 }
 
 func (pb *PlayerBar) previousSong() {
@@ -360,6 +481,7 @@ func (pb *PlayerBar) handleSongFinished() {
 		go pb.recordPlay(pb.currentSong)
 	}
 
+	time.Sleep(100 * time.Millisecond)
 	pb.nextSong()
 }
 
@@ -368,7 +490,7 @@ func (pb *PlayerBar) recordPlay(song *types.Song) {
 	song.Played++
 
 	if err := pb.storage.SaveSong(ctx, song); err != nil {
-		log.Printf("Failed to update play count for song %s: %v", song.Name, err)
+		log.Printf("[PLAYER_BAR] Failed to update play count for song %s: %v", song.Name, err)
 	}
 }
 
@@ -409,7 +531,7 @@ func (pb *PlayerBar) toggleLike() {
 	go func() {
 		ctx := context.Background()
 		if err := pb.storage.SaveSong(ctx, pb.currentSong); err != nil {
-			log.Printf("Failed to update like status: %v", err)
+			log.Printf("[PLAYER_BAR] Failed to update like status: %v", err)
 		}
 	}()
 
@@ -457,32 +579,18 @@ func (pb *PlayerBar) updateLikeButton() {
 	})
 }
 
-func (pb *PlayerBar) onSeek(value float64) {
-	duration := pb.player.GetDuration()
-	position := time.Duration(float64(duration) * value / 100)
-	fyne.Do(func() {
-		pb.timeLabel.SetText(fmt.Sprintf("%s / %s",
-			formatDuration(position),
-			formatDuration(duration)))
-	})
-}
-
-func (pb *PlayerBar) onSeekEnded(value float64) {
-	duration := pb.player.GetDuration()
-	position := time.Duration(float64(duration) * value / 100)
-	_ = pb.player.Seek(position)
-}
-
-func (pb *PlayerBar) onVolumeChange(value float64) {
-	_ = pb.player.SetVolume(value / 100)
+func (pb *PlayerBar) onVolumeChange(v float64) {
+	if err := pb.player.SetVolume(v / 100); err != nil {
+		log.Printf("[PLAYER_BAR] Failed to set volume: %v", err)
+	}
 
 	fyne.Do(func() {
-		if value == 0 {
-			pb.volumeIcon.SetResource(theme.VolumeDownIcon())
-		} else if value < 50 {
-			pb.volumeIcon.SetResource(theme.VolumeDownIcon())
+		if v == 0 {
+			pb.volumeBtn.SetIcon(theme.VolumeMuteIcon())
+		} else if v < 50 {
+			pb.volumeBtn.SetIcon(theme.VolumeDownIcon())
 		} else {
-			pb.volumeIcon.SetResource(theme.VolumeUpIcon())
+			pb.volumeBtn.SetIcon(theme.VolumeUpIcon())
 		}
 	})
 }
@@ -490,23 +598,29 @@ func (pb *PlayerBar) onVolumeChange(value float64) {
 func (pb *PlayerBar) playSong(song *types.Song) {
 	ctx := context.Background()
 	if err := pb.player.Play(ctx, song); err != nil {
-		log.Printf("Failed to play song: %v", err)
+		log.Printf("[PLAYER_BAR] Failed to play song: %v", err)
+
+		go func() {
+			time.Sleep(500 * time.Millisecond)
+			pb.nextSong()
+		}()
 		return
 	}
 
 	pb.SetCurrentSong(song)
-	fyne.Do(func() {
-		pb.playBtn.SetIcon(theme.MediaPauseIcon())
-	})
 	pb.isPlaying = true
+	pb.updatePlayButton()
 }
 
 func (pb *PlayerBar) stop() {
-	_ = pb.player.Stop()
+	if err := pb.player.Stop(); err != nil {
+		log.Printf("[PLAYER_BAR] Failed to stop: %v", err)
+	}
 	fyne.Do(func() {
 		pb.playBtn.SetIcon(theme.MediaPlayIcon())
 		pb.timeLabel.SetText("0:00 / 0:00")
 		pb.seekBar.SetValue(0)
+		pb.bufferProgress.Hide()
 	})
 	pb.isPlaying = false
 }
@@ -576,12 +690,25 @@ func getArtistNames(authors []*types.Author) string {
 	if len(authors) == 0 {
 		return "Unknown Artist"
 	}
-	if len(authors) == 1 {
-		return authors[0].Name
+
+	names := make([]string, 0, len(authors))
+	for _, author := range authors {
+		if author != nil && author.Name != "" {
+			names = append(names, author.Name)
+		}
 	}
 
-	if len(authors) == 2 {
-		return fmt.Sprintf("%s & %s", authors[0].Name, authors[1].Name)
+	if len(names) == 0 {
+		return "Unknown Artist"
 	}
-	return fmt.Sprintf("%s & %d others", authors[0].Name, len(authors)-1)
+
+	if len(names) == 1 {
+		return names[0]
+	}
+
+	if len(names) == 2 {
+		return names[0] + " & " + names[1]
+	}
+
+	return strings.Join(names, ", ")
 }

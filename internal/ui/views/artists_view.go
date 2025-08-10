@@ -2,6 +2,7 @@ package views
 
 import (
 	"context"
+	"fmt"
 	"sort"
 	"strings"
 	"sync"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/Alexander-D-Karpov/amp/internal/handlers"
 	"github.com/Alexander-D-Karpov/amp/internal/services"
+	"github.com/Alexander-D-Karpov/amp/internal/ui/components"
 	"github.com/Alexander-D-Karpov/amp/pkg/types"
 )
 
@@ -29,11 +31,12 @@ type ArtistsView struct {
 	debug        bool
 
 	container   *fyne.Container
-	artistsGrid *fyne.Container
+	mediaGrid   *components.MediaGrid
 	searchEntry *widget.Entry
 	refreshBtn  *widget.Button
 	sortSelect  *widget.Select
 	loader      *widget.ProgressBarInfinite
+	statusLabel *widget.Label
 
 	mu              sync.RWMutex
 	artists         []*types.Author
@@ -48,7 +51,7 @@ func NewArtistsView(musicService *services.MusicService, imageService *services.
 		musicService:    musicService,
 		imageService:    imageService,
 		handlers:        handlers,
-		debug:           debug,
+		debug:           false, // Reduced debug logging
 		artists:         make([]*types.Author, 0),
 		filteredArtists: make([]*types.Author, 0),
 	}
@@ -71,17 +74,34 @@ func (av *ArtistsView) setupWidgets() {
 	}, av.onSortChanged)
 	av.sortSelect.SetSelected(sortNameAZ)
 
-	av.artistsGrid = container.NewGridWithColumns(4)
+	av.mediaGrid = components.NewMediaGrid(fyne.NewSize(160, 200), av.imageService)
+	av.mediaGrid.SetItemTapCallback(av.onGridItemTapped)
+
 	av.loader = widget.NewProgressBarInfinite()
 	av.loader.Hide()
+
+	av.statusLabel = widget.NewLabel("Loading artists...")
 }
 
 func (av *ArtistsView) setupLayout() {
 	searchBar := container.NewBorder(nil, nil, nil, av.refreshBtn, av.searchEntry)
 	controls := container.NewHBox(widget.NewLabel("Sort:"), av.sortSelect)
-	header := container.NewVBox(searchBar, controls)
-	content := container.NewScroll(av.artistsGrid)
+	header := container.NewVBox(searchBar, controls, av.statusLabel)
+	content := container.NewScroll(av.mediaGrid)
 	av.container = container.NewBorder(header, av.loader, nil, nil, content)
+}
+
+func (av *ArtistsView) onGridItemTapped(index int) {
+	av.mu.RLock()
+	defer av.mu.RUnlock()
+
+	if index < len(av.filteredArtists) && av.handlers != nil {
+		artist := av.filteredArtists[index]
+		if av.debug {
+			fmt.Printf("[ARTIST_VIEW] Artist selected: %s\n", artist.Name)
+		}
+		av.handlers.HandleArtistSelection(artist)
+	}
 }
 
 func (av *ArtistsView) onSearchChanged(query string) {
@@ -96,7 +116,7 @@ func (av *ArtistsView) onSearchChanged(query string) {
 func (av *ArtistsView) onSortChanged(option string) {
 	av.applySortAndFilter()
 	fyne.Do(func() {
-		av.refreshView()
+		av.updateGridView()
 	})
 }
 
@@ -111,6 +131,7 @@ func (av *ArtistsView) loadArtists() {
 
 	fyne.Do(func() {
 		av.loader.Show()
+		av.statusLabel.SetText("Loading artists...")
 	})
 
 	go func() {
@@ -133,6 +154,9 @@ func (av *ArtistsView) loadArtists() {
 
 		artists, _, err := av.musicService.GetAuthors(ctx, 1, query)
 		if err != nil {
+			fyne.Do(func() {
+				av.statusLabel.SetText(fmt.Sprintf("Error: %v", err))
+			})
 			return
 		}
 
@@ -142,7 +166,7 @@ func (av *ArtistsView) loadArtists() {
 		av.mu.Unlock()
 
 		fyne.Do(func() {
-			av.refreshView()
+			av.updateGridView()
 		})
 	}()
 }
@@ -174,76 +198,52 @@ func (av *ArtistsView) applySortAndFilter() {
 	})
 }
 
-func (av *ArtistsView) refreshView() {
-	if av.artistsGrid == nil {
+func (av *ArtistsView) updateGridView() {
+	if av.mediaGrid == nil {
 		return
 	}
-
-	av.artistsGrid.RemoveAll()
 
 	av.mu.RLock()
 	artists := make([]*types.Author, len(av.filteredArtists))
 	copy(artists, av.filteredArtists)
 	av.mu.RUnlock()
 
+	var items []components.MediaItem
 	if len(artists) == 0 {
-		emptyLabel := widget.NewLabel("No artists found")
-		emptyLabel.Alignment = fyne.TextAlignCenter
-		av.artistsGrid.Add(emptyLabel)
+		fyne.Do(func() {
+			av.statusLabel.SetText("No artists found")
+		})
 	} else {
-		for _, artist := range artists {
+		fyne.Do(func() {
+			av.statusLabel.SetText(fmt.Sprintf("Showing %d artists", len(artists)))
+		})
+		items = make([]components.MediaItem, len(artists))
+		for i, artist := range artists {
 			if artist != nil {
-				av.artistsGrid.Add(av.createArtistCard(artist))
+				items[i] = components.MediaItemFromAuthor(artist)
 			}
 		}
 	}
 
-	av.artistsGrid.Refresh()
-}
-
-func (av *ArtistsView) createArtistCard(artist *types.Author) fyne.CanvasObject {
-	avatar := widget.NewIcon(theme.AccountIcon())
-	avatar.Resize(fyne.NewSize(120, 120))
-
-	name := widget.NewLabel(artist.Name)
-	name.Alignment = fyne.TextAlignCenter
-	name.TextStyle = fyne.TextStyle{Bold: true}
-	name.Wrapping = fyne.TextWrapWord
-	if len(name.Text) > 30 {
-		name.SetText(name.Text[:30] + "...")
+	av.mediaGrid.SetItems(items)
+	if len(artists) > 100 {
+		av.mediaGrid.SetVirtualScroll(true)
 	}
-
-	if artist.ImageCropped != nil && *artist.ImageCropped != "" {
-		go func(imageURL string, avatarWidget *widget.Icon) {
-			imageRes := av.imageService.GetImage(imageURL)
-			fyne.Do(func() {
-				avatarWidget.SetResource(imageRes)
-			})
-		}(*artist.ImageCropped, avatar)
-	}
-
-	content := container.NewVBox(avatar, name)
-
-	btn := widget.NewButton("", func() {
-		av.handlers.HandleArtistSelection(artist)
-	})
-
-	return container.NewStack(content, btn)
 }
 
 func (av *ArtistsView) SetCompactMode(compact bool) {
 	av.compactMode = compact
-	cols := 4
-	if compact {
-		cols = 2
-	}
 	fyne.Do(func() {
-		av.artistsGrid = container.NewGridWithColumns(cols)
-		av.refreshView()
+		av.mediaGrid.SetCompactMode(compact)
+		av.updateGridView()
 	})
 }
 
 func (av *ArtistsView) Refresh() {
+	av.mu.Lock()
+	av.artists = make([]*types.Author, 0)
+	av.filteredArtists = make([]*types.Author, 0)
+	av.mu.Unlock()
 	av.loadArtists()
 }
 

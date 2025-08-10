@@ -132,6 +132,12 @@ func initCore(cfg *config.Config) (*Core, error) {
 	musicService := services.NewMusicService(apiClient, storageDB, searchEngine)
 	imageService := services.NewImageService(imageLoader)
 
+	// Reduce debug logging for services
+	if !cfg.Debug {
+		musicService.SetDebug(false)
+		imageService.SetDebug(false)
+	}
+
 	return &Core{
 		api:             apiClient,
 		storage:         storageDB,
@@ -155,6 +161,9 @@ func (a *App) initUI() error {
 	}
 
 	a.ui.playerBar.SetConfig(a.cfg)
+	// Set the parent window for player bar (for volume popup)
+	a.ui.playerBar.SetParentWindow(a.window)
+
 	a.ui.loadingIndicator.Hide()
 	a.ui.mainView = views.NewMainView(a.core.musicService, a.core.imageService, a.core.downloadManager, a.cfg)
 

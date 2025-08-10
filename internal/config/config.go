@@ -3,13 +3,13 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 
 	"github.com/spf13/viper"
 
 	"github.com/Alexander-D-Karpov/amp/internal/platform"
 )
 
-// Config represents the application configuration
 type Config struct {
 	Debug bool `mapstructure:"debug"`
 
@@ -34,10 +34,14 @@ type Config struct {
 	} `mapstructure:"storage"`
 
 	Audio struct {
-		SampleRate    int     `mapstructure:"sample_rate"`
-		BufferSize    int     `mapstructure:"buffer_size"`
-		DefaultVolume float64 `mapstructure:"default_volume"`
-		Crossfade     bool    `mapstructure:"crossfade"`
+		SampleRate      int     `mapstructure:"sample_rate"`
+		BufferSize      int     `mapstructure:"buffer_size"`
+		DefaultVolume   float64 `mapstructure:"default_volume"`
+		Crossfade       bool    `mapstructure:"crossfade"`
+		LowLatencyMode  bool    `mapstructure:"low_latency_mode"`
+		PlatformOptimal bool    `mapstructure:"platform_optimal"`
+		MaxChannels     int     `mapstructure:"max_channels"`
+		BitDepth        int     `mapstructure:"bit_depth"`
 	} `mapstructure:"audio"`
 
 	UI struct {
@@ -47,6 +51,8 @@ type Config struct {
 		GridColumns  int    `mapstructure:"grid_columns"`
 		WindowWidth  int    `mapstructure:"window_width"`
 		WindowHeight int    `mapstructure:"window_height"`
+		VirtualGrid  bool   `mapstructure:"virtual_grid"`
+		ImageQuality string `mapstructure:"image_quality"`
 	} `mapstructure:"ui"`
 
 	Search struct {
@@ -73,7 +79,6 @@ type Config struct {
 	} `mapstructure:"user"`
 }
 
-// Load loads configuration from file or uses defaults
 func Load(configPath string) (*Config, error) {
 	viper.SetConfigName("config")
 	viper.SetConfigType("yaml")
@@ -110,10 +115,11 @@ func Load(configPath string) (*Config, error) {
 		return nil, err
 	}
 
+	optimizeForPlatform(&cfg)
+
 	return &cfg, nil
 }
 
-// DefaultMobileConfig returns a default configuration optimized for mobile devices
 func DefaultMobileConfig() *Config {
 	cfg := &Config{}
 	setDefaults()
@@ -127,6 +133,10 @@ func DefaultMobileConfig() *Config {
 	cfg.UI.WindowWidth = 400
 	cfg.UI.WindowHeight = 800
 	cfg.UI.GridColumns = 2
+	cfg.Audio.BufferSize = 16384
+	cfg.Audio.LowLatencyMode = false
+	cfg.UI.VirtualGrid = true
+	cfg.UI.ImageQuality = "medium"
 
 	return cfg
 }
@@ -151,16 +161,22 @@ func setDefaults() {
 	viper.SetDefault("storage.enable_wal", true)
 
 	viper.SetDefault("audio.sample_rate", 44100)
-	viper.SetDefault("audio.buffer_size", 8192)
+	viper.SetDefault("audio.buffer_size", getDefaultBufferSize())
 	viper.SetDefault("audio.default_volume", 0.7)
 	viper.SetDefault("audio.crossfade", false)
+	viper.SetDefault("audio.low_latency_mode", false)
+	viper.SetDefault("audio.platform_optimal", true)
+	viper.SetDefault("audio.max_channels", 2)
+	viper.SetDefault("audio.bit_depth", 16)
 
 	viper.SetDefault("ui.theme", "dark")
 	viper.SetDefault("ui.language", "en")
 	viper.SetDefault("ui.show_stats", false)
-	viper.SetDefault("ui.grid_columns", 4)
+	viper.SetDefault("ui.grid_columns", getDefaultGridColumns())
 	viper.SetDefault("ui.window_width", 1200)
 	viper.SetDefault("ui.window_height", 800)
+	viper.SetDefault("ui.virtual_grid", false)
+	viper.SetDefault("ui.image_quality", "high")
 
 	viper.SetDefault("search.max_results", 100)
 	viper.SetDefault("search.fuzzy_threshold", 0.6)
@@ -173,6 +189,56 @@ func setDefaults() {
 	viper.SetDefault("download.auto_download", false)
 
 	viper.SetDefault("user.is_anonymous", true)
+}
+
+func getDefaultBufferSize() int {
+	switch runtime.GOOS {
+	case "linux":
+		return 16384
+	case "windows":
+		return 8192
+	case "darwin":
+		return 8192
+	default:
+		return 16384
+	}
+}
+
+func getDefaultGridColumns() int {
+	switch runtime.GOOS {
+	case "android", "ios":
+		return 2
+	default:
+		return 4
+	}
+}
+
+func optimizeForPlatform(cfg *Config) {
+	if !cfg.Audio.PlatformOptimal {
+		return
+	}
+
+	switch runtime.GOOS {
+	case "linux":
+		if cfg.Audio.BufferSize < 8192 {
+			cfg.Audio.BufferSize = 16384
+		}
+		cfg.UI.VirtualGrid = true
+	case "windows":
+		if cfg.Audio.LowLatencyMode {
+			cfg.Audio.BufferSize = 4096
+		}
+	case "darwin":
+		if cfg.Audio.LowLatencyMode {
+			cfg.Audio.BufferSize = 4096
+		}
+	case "android":
+		cfg.Audio.BufferSize = 16384
+		cfg.UI.GridColumns = 2
+		cfg.UI.VirtualGrid = true
+		cfg.UI.ImageQuality = "medium"
+		cfg.Storage.MaxCacheSize = 512 * 1024 * 1024
+	}
 }
 
 func ensureDirectories(cfg *Config) error {
@@ -191,7 +257,6 @@ func ensureDirectories(cfg *Config) error {
 	return nil
 }
 
-// Save saves the current configuration to file
 func (c *Config) Save() error {
 	configDir, err := platform.GetConfigDir()
 	if err != nil {

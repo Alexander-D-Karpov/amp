@@ -7,6 +7,7 @@ toolchain go1.24.0
 require (
 	fyne.io/fyne/v2 v2.6.0
 	github.com/gopxl/beep v1.3.0
+	github.com/gordonklaus/portaudio v0.0.0-20250206071425-98a94950218b
 	github.com/hashicorp/go-retryablehttp v0.7.8
 	github.com/lithammer/fuzzysearch v1.1.8
 	github.com/spf13/viper v1.18.2

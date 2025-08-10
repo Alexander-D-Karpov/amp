@@ -837,22 +837,26 @@ func (d *Database) Close() error {
 	return nil
 }
 
-func (d *Database) scanSong(scanner interface {
-	Scan(dest ...interface{}) error
-}) (*types.Song, error) {
+func (d *Database) scanSong(scanner interface{ Scan(...any) error }) (*types.Song, error) {
 	var song types.Song
 	var volumeJSON string
-	var albumSlugRef, albumName, albumImage, albumImageCropped, albumLink string
+	var albumSlug sql.NullString
+	var albumSlugRef, albumName,
+		albumImage, albumImageCropped, albumLink string
 
 	err := scanner.Scan(
 		&song.Slug, &song.Name, &song.File, &song.Image, &song.ImageCropped,
 		&song.Length, &song.Played, &song.Link, &song.Liked, &volumeJSON,
-		&song.AlbumSlug, &song.LocalPath, &song.Downloaded, &song.LastSync,
+		&albumSlug, &song.LocalPath, &song.Downloaded, &song.LastSync,
 		&song.CreatedAt, &song.UpdatedAt,
 		&albumSlugRef, &albumName, &albumImage, &albumImageCropped, &albumLink,
 	)
 	if err != nil {
 		return nil, err
+	}
+
+	if albumSlug.Valid { // NULL-safety
+		song.AlbumSlug = albumSlug.String
 	}
 
 	if volumeJSON != "" && volumeJSON != "[]" {

@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
+	"net"
 	"net/http"
 	"os"
 	"runtime"
@@ -21,8 +23,12 @@ import (
 	"github.com/gopxl/beep/speaker"
 )
 
-var speakerInitialized = false
-var speakerMutex sync.Mutex
+var (
+	speakerInitialized = false
+	speakerMutex       sync.Mutex
+	globalSampleRate   beep.SampleRate
+	speakerOnce        sync.Once
+)
 
 type Player struct {
 	mu sync.Mutex
@@ -44,69 +50,106 @@ type Player struct {
 	debug            bool
 	playing          bool
 	paused           bool
+	bufferSize       int
+
+	downloadBuffer []byte
+	downloadMu     sync.RWMutex
+	downloadPos    int64
+	totalSize      int64
+	isStreaming    bool
+	streamReader   *ProgressiveReader
+}
+
+type ProgressiveReader struct {
+	url          string
+	buffer       []byte
+	totalSize    int64
+	downloaded   int64
+	mu           sync.RWMutex
+	httpClient   *http.Client
+	ctx          context.Context
+	cancel       context.CancelFunc
+	downloadDone bool
+	lastRead     time.Time
 }
 
 func NewPlayer(cfg *config.Config, storage *storage.Database) (*Player, error) {
 	p := &Player{
-		cfg:        cfg,
-		storage:    storage,
-		done:       make(chan struct{}),
-		httpClient: &http.Client{Timeout: 30 * time.Second},
+		cfg:     cfg,
+		storage: storage,
+		done:    make(chan struct{}),
+		httpClient: &http.Client{
+			Timeout: 30 * time.Second,
+			Transport: &http.Transport{
+				DialContext: (&net.Dialer{
+					Timeout:   10 * time.Second,
+					KeepAlive: 30 * time.Second,
+				}).DialContext,
+				TLSHandshakeTimeout: 15 * time.Second,
+				MaxIdleConns:        10,
+			},
+		},
 		sampleRate: beep.SampleRate(cfg.Audio.SampleRate),
 		debug:      cfg.Debug,
 		playing:    false,
 		paused:     false,
 	}
 
+	p.bufferSize = p.calculateOptimalBufferSize()
+
 	if err := p.initializeSpeaker(); err != nil {
 		return nil, fmt.Errorf("failed to initialize speaker: %w", err)
 	}
 
-	p.ticker = time.NewTicker(100 * time.Millisecond)
+	p.ticker = time.NewTicker(50 * time.Millisecond)
 	go p.positionUpdater()
 
 	if p.debug {
-		log.Printf("[AUDIO] Player initialized successfully on %s with sample rate: %d", runtime.GOOS, p.sampleRate)
+		log.Printf("[AUDIO] Player initialized - OS: %s, Sample Rate: %d, Buffer: %d",
+			runtime.GOOS, p.sampleRate, p.bufferSize)
 	}
 
 	return p, nil
 }
 
+func (p *Player) calculateOptimalBufferSize() int {
+	baseBuffer := p.cfg.Audio.BufferSize
+
+	switch runtime.GOOS {
+	case "linux":
+		return baseBuffer * 2
+	case "windows":
+		return baseBuffer
+	case "darwin":
+		return baseBuffer
+	default:
+		return baseBuffer * 2
+	}
+}
+
 func (p *Player) initializeSpeaker() error {
-	speakerMutex.Lock()
-	defer speakerMutex.Unlock()
-
-	if speakerInitialized {
+	var err error
+	speakerOnce.Do(func() {
+		buf := p.sampleRate.N(200 * time.Millisecond)
+		err = speaker.Init(p.sampleRate, buf)
 		if p.debug {
-			log.Printf("[AUDIO] Speaker already initialized")
+			log.Printf("[AUDIO] speaker.Init(%d, %d)", p.sampleRate, buf)
 		}
-		return nil
-	}
+	})
+	return err
+}
 
-	bufferSize := p.sampleRate.N(time.Second / 10)
-
-	if runtime.GOOS == "linux" {
-		if p.debug {
-			log.Printf("[AUDIO] Initializing speaker for Linux with optimized settings")
-		}
-		bufferSize = p.sampleRate.N(time.Second / 5)
+func (p *Player) mkVolume(vol float64) *effects.Volume {
+	v := &effects.Volume{
+		Streamer: p.ctrl,
+		Base:     2,
 	}
-
-	if p.debug {
-		log.Printf("[AUDIO] Initializing speaker with sample rate %d, buffer size %d on %s",
-			p.sampleRate, bufferSize, runtime.GOOS)
+	if vol <= 0 {
+		v.Silent = true
+	} else {
+		v.Volume = (vol - 1) * 5
 	}
-
-	err := speaker.Init(p.sampleRate, bufferSize)
-	if err != nil {
-		return fmt.Errorf("speaker initialization failed: %w", err)
-	}
-
-	speakerInitialized = true
-	if p.debug {
-		log.Printf("[AUDIO] Speaker initialized successfully")
-	}
-	return nil
+	return v
 }
 
 func (p *Player) Play(ctx context.Context, song *types.Song) error {
@@ -123,6 +166,7 @@ func (p *Player) Play(ctx context.Context, song *types.Song) error {
 	p.currentSong = song
 	p.playing = false
 	p.paused = false
+	p.position = 0
 	p.mu.Unlock()
 
 	go p.loadAndPlay(ctx, song)
@@ -136,26 +180,39 @@ func (p *Player) loadAndPlay(ctx context.Context, song *types.Song) {
 
 	var reader io.ReadCloser
 	var err error
+	var isLocal bool
 
 	if song.LocalPath != nil && *song.LocalPath != "" {
-		if _, statErr := os.Stat(*song.LocalPath); statErr == nil {
+		if _, err := os.Stat(*song.LocalPath); err == nil {
 			reader, err = os.Open(*song.LocalPath)
+			isLocal = true
 			if p.debug {
-				log.Printf("[AUDIO] Using local file: %s", *song.LocalPath)
+				log.Printf("[AUDIO] Using local file %s", *song.LocalPath)
 			}
 		}
 	}
 
 	if reader == nil {
+		p.mu.Lock()
+		p.isStreaming = true
+		p.mu.Unlock()
+
 		if p.debug {
-			log.Printf("[AUDIO] Streaming from URL: %s", song.File)
+			log.Printf("[AUDIO] Streaming %s", song.File)
 		}
-		reader, err = p.streamFromURL(ctx, song.File)
+
+		reader, err = p.streamFromURLWithRetry(ctx, song.File, 3)
+		if err != nil {
+			if p.debug {
+				log.Printf("[AUDIO] Failed to stream after retries: %v", err)
+			}
+			return
+		}
 	}
 
-	if err != nil {
+	if reader == nil {
 		if p.debug {
-			log.Printf("[AUDIO] Failed to get audio stream for '%s': %v", song.Name, err)
+			log.Printf("[AUDIO] No audio source available for '%s'", song.Name)
 		}
 		return
 	}
@@ -179,23 +236,33 @@ func (p *Player) loadAndPlay(ctx context.Context, song *types.Song) {
 		return
 	}
 
-	duration := format.SampleRate.D(streamer.Len())
+	var duration time.Duration
+	if song.Length > 0 {
+		duration = time.Duration(song.Length) * time.Second
+	} else if isLocal {
+		duration = format.SampleRate.D(streamer.Len())
+	}
+
 	p.duration = duration
 	p.streamer = streamer
 
 	if p.debug {
-		log.Printf("[AUDIO] Audio format - Sample Rate: %d, Channels: %d, Length: %d samples, Duration: %v",
-			format.SampleRate, format.NumChannels, streamer.Len(), duration)
+		log.Printf("[AUDIO] Audio loaded - Sample Rate: %d, Channels: %d, Duration: %v",
+			format.SampleRate, format.NumChannels, duration)
 	}
 
-	resampled := beep.Resample(4, format.SampleRate, p.sampleRate, streamer)
-	p.ctrl = &beep.Ctrl{Streamer: resampled, Paused: false}
-	p.volume = &effects.Volume{
-		Streamer: p.ctrl,
-		Base:     2,
-		Volume:   (p.cfg.Audio.DefaultVolume - 1) * 5,
-		Silent:   p.cfg.Audio.DefaultVolume == 0,
+	var resampled beep.Streamer
+	if format.SampleRate != p.sampleRate {
+		resampled = beep.Resample(4, format.SampleRate, p.sampleRate, streamer)
+		if p.debug {
+			log.Printf("[AUDIO] Resampling from %d to %d", format.SampleRate, p.sampleRate)
+		}
+	} else {
+		resampled = streamer
 	}
+
+	p.ctrl = &beep.Ctrl{Streamer: resampled, Paused: false}
+	p.volume = p.mkVolume(p.cfg.Audio.DefaultVolume)
 
 	speaker.Clear()
 
@@ -212,7 +279,7 @@ func (p *Player) loadAndPlay(ctx context.Context, song *types.Song) {
 	p.mu.Unlock()
 
 	if p.debug {
-		log.Printf("[AUDIO] Started playback for '%s', duration: %v", song.Name, duration)
+		log.Printf("[AUDIO] Started playback for '%s'", song.Name)
 	}
 
 	select {
@@ -241,6 +308,36 @@ func (p *Player) loadAndPlay(ctx context.Context, song *types.Song) {
 	}
 }
 
+func (p *Player) streamFromURLWithRetry(ctx context.Context, url string, maxRetries int) (io.ReadCloser, error) {
+	var lastErr error
+
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		if attempt > 0 {
+			if p.debug {
+				log.Printf("[AUDIO] Retry attempt %d/%d for %s", attempt+1, maxRetries, url)
+			}
+			sleepTime := time.Duration(attempt) * time.Second
+			select {
+			case <-time.After(sleepTime):
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
+
+		reader, err := p.streamFromURL(ctx, url)
+		if err == nil {
+			return reader, nil
+		}
+		lastErr = err
+
+		if p.debug {
+			log.Printf("[AUDIO] Stream attempt %d failed: %v", attempt+1, err)
+		}
+	}
+
+	return nil, fmt.Errorf("failed after %d attempts: %w", maxRetries, lastErr)
+}
+
 func (p *Player) streamFromURL(ctx context.Context, url string) (io.ReadCloser, error) {
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
@@ -257,14 +354,133 @@ func (p *Player) streamFromURL(ctx context.Context, url string) (io.ReadCloser, 
 
 	if resp.StatusCode != http.StatusOK {
 		resp.Body.Close()
-		return nil, fmt.Errorf("bad status: %s", resp.Status)
+		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, resp.Status)
 	}
+
+	p.streamReader = &ProgressiveReader{
+		url:        url,
+		buffer:     make([]byte, 0, 10*1024*1024), // Pre-allocate 10MB
+		httpClient: p.httpClient,
+		lastRead:   time.Now(),
+	}
+
+	if contentLength := resp.Header.Get("Content-Length"); contentLength != "" {
+		if size, parseErr := parseContentLength(contentLength); parseErr == nil {
+			p.streamReader.totalSize = size
+			p.totalSize = size
+		}
+	}
+
+	p.streamReader.ctx, p.streamReader.cancel = context.WithCancel(ctx)
+	go p.streamReader.download(resp)
 
 	if p.debug {
-		log.Printf("[AUDIO] Successfully opened stream, Content-Length: %s", resp.Header.Get("Content-Length"))
+		log.Printf("[AUDIO] Stream opened successfully, Content-Length: %s",
+			resp.Header.Get("Content-Length"))
 	}
 
-	return resp.Body, nil
+	return &streamWrapper{reader: p.streamReader}, nil
+}
+
+func parseContentLength(s string) (int64, error) {
+	var result int64
+	for _, c := range s {
+		if c >= '0' && c <= '9' {
+			result = result*10 + int64(c-'0')
+		} else {
+			return 0, fmt.Errorf("invalid character")
+		}
+	}
+	return result, nil
+}
+
+type streamWrapper struct {
+	reader *ProgressiveReader
+}
+
+func (sw *streamWrapper) Read(p []byte) (int, error) {
+	return sw.reader.Read(p)
+}
+
+func (sw *streamWrapper) Close() error {
+	if sw.reader.cancel != nil {
+		sw.reader.cancel()
+	}
+	return nil
+}
+
+func (pr *ProgressiveReader) download(resp *http.Response) {
+	defer resp.Body.Close()
+
+	buffer := make([]byte, 32768)
+	for {
+		select {
+		case <-pr.ctx.Done():
+			pr.mu.Lock()
+			pr.downloadDone = true
+			pr.mu.Unlock()
+			return
+		default:
+		}
+
+		n, err := resp.Body.Read(buffer)
+		if n > 0 {
+			chunk := make([]byte, n)
+			copy(chunk, buffer[:n])
+
+			pr.mu.Lock()
+			pr.buffer = append(pr.buffer, chunk...)
+			pr.downloaded += int64(n)
+			pr.mu.Unlock()
+		}
+
+		if err != nil {
+			pr.mu.Lock()
+			pr.downloadDone = true
+			pr.mu.Unlock()
+			if err == io.EOF {
+				break
+			}
+			return
+		}
+	}
+}
+
+func (pr *ProgressiveReader) Read(p []byte) (int, error) {
+	// Wait for initial buffering
+	for i := 0; i < 100; i++ {
+		pr.mu.RLock()
+		available := len(pr.buffer)
+		pr.mu.RUnlock()
+
+		if available >= len(p) || available >= 65536 {
+			break
+		}
+
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	pr.mu.Lock()
+	defer pr.mu.Unlock()
+
+	available := len(pr.buffer)
+	if available == 0 {
+		if pr.downloadDone {
+			return 0, io.EOF
+		}
+		return 0, nil
+	}
+
+	n := len(p)
+	if n > available {
+		n = available
+	}
+
+	copy(p, pr.buffer[:n])
+	pr.buffer = append([]byte{}, pr.buffer[n:]...)
+	pr.lastRead = time.Now()
+
+	return n, nil
 }
 
 func (p *Player) stopInternal() {
@@ -281,15 +497,21 @@ func (p *Player) stopInternal() {
 		p.streamer = nil
 	}
 
+	if p.streamReader != nil && p.streamReader.cancel != nil {
+		p.streamReader.cancel()
+		p.streamReader = nil
+	}
+
 	p.ctrl = nil
 	p.volume = nil
 	p.position = 0
 	p.duration = 0
 	p.playing = false
 	p.paused = false
+	p.isStreaming = false
 
 	if p.debug {
-		log.Printf("[AUDIO] Audio playback stopped and cleaned up")
+		log.Printf("[AUDIO] Playback stopped and resources cleaned")
 	}
 }
 
@@ -374,18 +596,29 @@ func (p *Player) Seek(position time.Duration) error {
 	return nil
 }
 
-func (p *Player) SetVolume(volume float64) error {
+func (p *Player) SetVolume(level float64) error {
+	if level < 0 {
+		level = 0
+	}
+	if level > 1 {
+		level = 1
+	}
+
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	if p.volume != nil {
-		p.volume.Volume = (volume - 1) * 5
-		p.volume.Silent = volume == 0
-
-		if p.debug {
-			log.Printf("[AUDIO] Volume set to: %.2f", volume)
-		}
+	if p.volume == nil {
+		return nil
 	}
+
+	speaker.Lock()
+	if level == 0 {
+		p.volume.Silent = true
+	} else {
+		p.volume.Silent = false
+		p.volume.Volume = math.Log2(level)
+	}
+	speaker.Unlock()
 	return nil
 }
 
@@ -438,23 +671,46 @@ func (p *Player) positionUpdater() {
 
 func (p *Player) updatePosition() {
 	p.mu.Lock()
+	defer p.mu.Unlock()
+
 	if p.streamer != nil && p.playing && !p.paused {
 		currentPos := p.sampleRate.D(p.streamer.Position())
+
 		if currentPos != p.position {
 			p.position = currentPos
-			callback := p.positionCallback
-			pos := p.position
-			p.mu.Unlock()
-
-			if callback != nil {
-				fyne.Do(func() {
-					callback(pos)
-				})
+			if p.positionCallback != nil {
+				callback := p.positionCallback
+				pos := p.position
+				go func() {
+					fyne.Do(func() {
+						callback(pos)
+					})
+				}()
 			}
-		} else {
-			p.mu.Unlock()
 		}
-	} else {
-		p.mu.Unlock()
 	}
+}
+
+func (p *Player) GetDownloadProgress() float64 {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if !p.isStreaming || p.streamReader == nil {
+		return 1.0
+	}
+
+	p.streamReader.mu.RLock()
+	defer p.streamReader.mu.RUnlock()
+
+	if p.streamReader.totalSize == 0 {
+		return 0.0
+	}
+
+	return float64(p.streamReader.downloaded) / float64(p.streamReader.totalSize)
+}
+
+func (p *Player) GetCurrentSong() *types.Song {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.currentSong
 }
