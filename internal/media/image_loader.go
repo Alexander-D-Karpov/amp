@@ -2,6 +2,7 @@ package media
 
 import (
 	"bytes"
+	"container/list"
 	"context"
 	"crypto/sha256"
 	"fmt"
@@ -24,13 +25,12 @@ import (
 type ImageLoader struct {
 	storage      *db.Database
 	httpClient   *http.Client
-	memCache     sync.Map
+	lruCache     *LRUCache
 	downloadMu   sync.Map
 	mediaBase    string
 	debug        bool
 	cacheDir     string
 	maxCacheSize int64
-	maxMemItems  int
 	loadQueue    chan *loadRequest
 	workers      int
 }
@@ -42,10 +42,91 @@ type CachedResource struct {
 	url        string
 }
 
+type LRUCache struct {
+	capacity int
+	cache    map[string]*list.Element
+	list     *list.List
+	mu       sync.RWMutex
+}
+
+type lruItem struct {
+	key   string
+	value *CachedResource
+}
+
 type loadRequest struct {
 	url      string
 	callback func(fyne.Resource, error)
 	priority int
+}
+
+func NewLRUCache(capacity int) *LRUCache {
+	return &LRUCache{
+		capacity: capacity,
+		cache:    make(map[string]*list.Element),
+		list:     list.New(),
+	}
+}
+
+func (lru *LRUCache) Get(key string) (*CachedResource, bool) {
+	lru.mu.Lock()
+	defer lru.mu.Unlock()
+
+	if elem, ok := lru.cache[key]; ok {
+		lru.list.MoveToFront(elem)
+		item := elem.Value.(*lruItem)
+		item.value.lastAccess = time.Now()
+		return item.value, true
+	}
+	return nil, false
+}
+
+func (lru *LRUCache) Put(key string, value *CachedResource) {
+	lru.mu.Lock()
+	defer lru.mu.Unlock()
+
+	if elem, ok := lru.cache[key]; ok {
+		lru.list.MoveToFront(elem)
+		elem.Value.(*lruItem).value = value
+		return
+	}
+
+	if lru.list.Len() >= lru.capacity {
+		oldest := lru.list.Back()
+		if oldest != nil {
+			lru.list.Remove(oldest)
+			delete(lru.cache, oldest.Value.(*lruItem).key)
+		}
+	}
+
+	item := &lruItem{key: key, value: value}
+	elem := lru.list.PushFront(item)
+	lru.cache[key] = elem
+}
+
+func (lru *LRUCache) Range(fn func(key string, value *CachedResource) bool) {
+	lru.mu.RLock()
+	defer lru.mu.RUnlock()
+
+	for elem := lru.list.Front(); elem != nil; elem = elem.Next() {
+		item := elem.Value.(*lruItem)
+		if !fn(item.key, item.value) {
+			break
+		}
+	}
+}
+
+func (lru *LRUCache) Len() int {
+	lru.mu.RLock()
+	defer lru.mu.RUnlock()
+	return lru.list.Len()
+}
+
+func (lru *LRUCache) Clear() {
+	lru.mu.Lock()
+	defer lru.mu.Unlock()
+	lru.cache = make(map[string]*list.Element)
+	lru.list = list.New()
 }
 
 func NewImageLoader(cfg *config.Config, db *db.Database) (*ImageLoader, error) {
@@ -63,11 +144,11 @@ func NewImageLoader(cfg *config.Config, db *db.Database) (*ImageLoader, error) {
 	loader := &ImageLoader{
 		storage:      db,
 		httpClient:   &http.Client{Timeout: time.Duration(cfg.API.Timeout) * time.Second},
+		lruCache:     NewLRUCache(500),
 		mediaBase:    mediaBase,
 		debug:        cfg.Debug,
 		cacheDir:     cacheDir,
 		maxCacheSize: cfg.Storage.MaxCacheSize / 4,
-		maxMemItems:  500,
 		loadQueue:    make(chan *loadRequest, 1000),
 		workers:      4,
 	}
@@ -107,21 +188,15 @@ func (l *ImageLoader) GetResource(imageURL string) (fyne.Resource, error) {
 	fullURL := l.buildFullURL(imageURL)
 	cacheKey := l.generateCacheKey(fullURL)
 
-	if cached, ok := l.memCache.Load(cacheKey); ok {
-		if cachedRes, ok := cached.(*CachedResource); ok {
-			cachedRes.lastAccess = time.Now()
-			l.memCache.Store(cacheKey, cachedRes)
-			return cachedRes.resource, nil
-		}
+	if cached, ok := l.lruCache.Get(cacheKey); ok {
+		return cached.resource, nil
 	}
 
 	if _, loaded := l.downloadMu.LoadOrStore(fullURL, struct{}{}); loaded {
 		for i := 0; i < 100; i++ {
 			time.Sleep(10 * time.Millisecond)
-			if cached, ok := l.memCache.Load(cacheKey); ok {
-				if cachedRes, ok := cached.(*CachedResource); ok {
-					return cachedRes.resource, nil
-				}
+			if cached, ok := l.lruCache.Get(cacheKey); ok {
+				return cached.resource, nil
 			}
 		}
 		return theme.MediaMusicIcon(), fmt.Errorf("timeout waiting for download")
@@ -191,15 +266,11 @@ func (l *ImageLoader) GetResourceAsync(imageURL string, callback func(fyne.Resou
 	fullURL := l.buildFullURL(imageURL)
 	cacheKey := l.generateCacheKey(fullURL)
 
-	if cached, ok := l.memCache.Load(cacheKey); ok {
-		if cachedRes, ok := cached.(*CachedResource); ok {
-			cachedRes.lastAccess = time.Now()
-			l.memCache.Store(cacheKey, cachedRes)
-			fyne.Do(func() {
-				callback(cachedRes.resource, nil)
-			})
-			return
-		}
+	if cached, ok := l.lruCache.Get(cacheKey); ok {
+		fyne.Do(func() {
+			callback(cached.resource, nil)
+		})
+		return
 	}
 
 	req := &loadRequest{
@@ -289,96 +360,28 @@ func (l *ImageLoader) saveToDisk(path string, data []byte) error {
 }
 
 func (l *ImageLoader) storeInMemCache(key string, resource fyne.Resource, size int64, url string) {
-	l.evictIfNecessary(size)
-
 	cached := &CachedResource{
 		resource:   resource,
 		lastAccess: time.Now(),
 		size:       size,
 		url:        url,
 	}
-	l.memCache.Store(key, cached)
-}
-
-func (l *ImageLoader) evictIfNecessary(newSize int64) {
-	var totalSize int64
-	var itemCount int
-	var items []string
-
-	l.memCache.Range(func(key, value interface{}) bool {
-		if keyStr, ok := key.(string); ok {
-			if cached, ok := value.(*CachedResource); ok {
-				totalSize += cached.size
-				itemCount++
-				items = append(items, keyStr)
-			}
-		}
-		return true
-	})
-
-	if totalSize+newSize <= l.maxCacheSize && itemCount < l.maxMemItems {
-		return
-	}
-
-	type cacheItem struct {
-		key        string
-		lastAccess time.Time
-		size       int64
-	}
-
-	var sortedItems []cacheItem
-	for _, key := range items {
-		if cached, ok := l.memCache.Load(key); ok {
-			if cachedRes, ok := cached.(*CachedResource); ok {
-				sortedItems = append(sortedItems, cacheItem{
-					key:        key,
-					lastAccess: cachedRes.lastAccess,
-					size:       cachedRes.size,
-				})
-			}
-		}
-	}
-
-	for i := 0; i < len(sortedItems)-1; i++ {
-		for j := 0; j < len(sortedItems)-i-1; j++ {
-			if sortedItems[j].lastAccess.After(sortedItems[j+1].lastAccess) {
-				sortedItems[j], sortedItems[j+1] = sortedItems[j+1], sortedItems[j]
-			}
-		}
-	}
-
-	evictCount := len(sortedItems) / 4
-	if evictCount < 10 {
-		evictCount = 10
-	}
-
-	for i := 0; i < evictCount && i < len(sortedItems); i++ {
-		item := sortedItems[i]
-		l.memCache.Delete(item.key)
-		totalSize -= item.size
-		if totalSize+newSize <= l.maxCacheSize {
-			break
-		}
-	}
+	l.lruCache.Put(key, cached)
 }
 
 func (l *ImageLoader) cleanupMemoryCache() {
 	cutoff := time.Now().Add(-30 * time.Minute)
 	var toDelete []string
 
-	l.memCache.Range(func(key, value interface{}) bool {
-		if keyStr, ok := key.(string); ok {
-			if cached, ok := value.(*CachedResource); ok {
-				if cached.lastAccess.Before(cutoff) {
-					toDelete = append(toDelete, keyStr)
-				}
-			}
+	l.lruCache.Range(func(key string, cached *CachedResource) bool {
+		if cached.lastAccess.Before(cutoff) {
+			toDelete = append(toDelete, key)
 		}
 		return true
 	})
 
 	for _, key := range toDelete {
-		l.memCache.Delete(key)
+		l.lruCache.cache[key] = nil
 	}
 
 	if l.debug && len(toDelete) > 0 {
@@ -408,18 +411,13 @@ func (l *ImageLoader) generateResourceName(url string) string {
 }
 
 func (l *ImageLoader) ClearMemoryCache() {
-	l.memCache.Range(func(key, value interface{}) bool {
-		l.memCache.Delete(key)
-		return true
-	})
+	l.lruCache.Clear()
 }
 
 func (l *ImageLoader) GetCacheStats() (itemCount int, totalSize int64) {
-	l.memCache.Range(func(key, value interface{}) bool {
+	l.lruCache.Range(func(key string, cached *CachedResource) bool {
 		itemCount++
-		if cached, ok := value.(*CachedResource); ok {
-			totalSize += cached.size
-		}
+		totalSize += cached.size
 		return true
 	})
 	return
@@ -431,7 +429,7 @@ func (l *ImageLoader) PreloadImages(urls []string) {
 			fullURL := l.buildFullURL(url)
 			cacheKey := l.generateCacheKey(fullURL)
 
-			if _, ok := l.memCache.Load(cacheKey); !ok {
+			if _, ok := l.lruCache.Get(cacheKey); !ok {
 				req := &loadRequest{
 					url:      fullURL,
 					callback: nil,

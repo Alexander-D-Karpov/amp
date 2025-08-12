@@ -57,7 +57,18 @@ func (c *Client) Login(ctx context.Context, username, password string) (*AuthRes
 	}
 
 	c.token = authResp.Token
+	c.isAnonymous = false
+	c.persistToken()
 	return &authResp, nil
+}
+
+func (c *Client) persistToken() {
+	if c.cfg == nil {
+		return
+	}
+	c.cfg.API.Token = c.token
+	c.cfg.User.IsAnonymous = c.isAnonymous
+	_ = c.cfg.Save()
 }
 
 // ValidateToken validates an authentication token
@@ -112,6 +123,8 @@ func (c *Client) RefreshToken(ctx context.Context) (*AuthResponse, error) {
 	}
 
 	c.token = authResp.Token
+	c.isAnonymous = false
+	c.persistToken()
 	return &authResp, nil
 }
 
@@ -128,8 +141,7 @@ func (c *Client) Logout(ctx context.Context) error {
 
 	c.token = ""
 	c.isAnonymous = true
-	c.debugLog("Logged out successfully")
-
+	c.persistToken()
 	return nil
 }
 
@@ -137,16 +149,42 @@ func (c *Client) Logout(ctx context.Context) error {
 func (c *Client) SetToken(token string) {
 	oldToken := c.token
 	c.token = token
-
 	if token == "" {
 		c.isAnonymous = true
-		c.debugLog("Token cleared - switching to anonymous mode")
 	} else {
 		c.isAnonymous = false
-		c.debugLog("Token updated: %s... (was: %s...)",
-			token[:min(len(token), 10)],
-			oldToken[:min(len(oldToken), 10)])
 	}
+	c.persistToken()
+	c.debugLog("Token updated: %s... (was: %s...)", token[:min(len(token), 10)], oldToken[:min(len(oldToken), 10)])
+}
+
+func (c *Client) GetAnonymousToken(ctx context.Context) (string, error) {
+	if c.token != "" && c.isAnonymous {
+		c.debugLog("Using stored anonymous token: %s...", c.token[:min(len(c.token), 10)])
+		return c.token, nil
+	}
+
+	c.debugLog("Requesting anonymous token...")
+	_, body, err := c.makeRequest(ctx, "POST", "/music/anon/create/", nil, map[string]interface{}{})
+	if err != nil {
+		c.isAnonymous = true
+		c.token = ""
+		return "", fmt.Errorf("get anonymous token: %w", err)
+	}
+	var authResp struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(body, &authResp); err != nil {
+		c.isAnonymous = true
+		c.token = ""
+		return "", fmt.Errorf("parse anonymous token response: %w", err)
+	}
+
+	c.token = authResp.ID
+	c.isAnonymous = true
+	c.persistToken()
+	c.debugLog("Anonymous token obtained successfully: %s...", authResp.ID[:min(len(authResp.ID), 10)])
+	return authResp.ID, nil
 }
 
 // GetToken returns the current authentication token

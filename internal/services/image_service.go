@@ -1,6 +1,8 @@
 package services
 
 import (
+	"fmt"
+	"github.com/Alexander-D-Karpov/amp/pkg/types"
 	"log"
 	"sync"
 	"time"
@@ -94,7 +96,22 @@ func (s *ImageService) GetImageWithCallback(url string, callback func(fyne.Resou
 	return s.fallback
 }
 
+func (s *ImageService) generateCacheKey(url string, size fyne.Size) string {
+	// size-aware cache key
+	if size.Width <= 0 || size.Height <= 0 {
+		return url
+	}
+	return fmt.Sprintf("%s@%dx%d", url, int(size.Width), int(size.Height))
+}
+
 func (s *ImageService) GetImageWithSize(url string, size fyne.Size, callback func(fyne.Resource, error)) fyne.Resource {
+	if url == "" {
+		if callback != nil {
+			fyne.Do(func() { callback(s.fallback, nil) })
+		}
+		return s.fallback
+	}
+
 	cacheKey := s.generateCacheKey(url, size)
 
 	if cached, ok := s.cache.Load(cacheKey); ok {
@@ -102,9 +119,7 @@ func (s *ImageService) GetImageWithSize(url string, size fyne.Size, callback fun
 			entry.timestamp = time.Now()
 			s.cache.Store(cacheKey, entry)
 			if callback != nil {
-				fyne.Do(func() {
-					callback(entry.resource, nil)
-				})
+				fyne.Do(func() { callback(entry.resource, nil) })
 			}
 			return entry.resource
 		}
@@ -120,10 +135,6 @@ func (s *ImageService) GetImageWithSize(url string, size fyne.Size, callback fun
 
 	go s.loadImageWithSizeAsync(url, size, cacheKey)
 	return s.fallback
-}
-
-func (s *ImageService) generateCacheKey(url string, size fyne.Size) string {
-	return url
 }
 
 func (s *ImageService) loadImageWithSizeAsync(url string, size fyne.Size, cacheKey string) {
@@ -368,4 +379,33 @@ func (s *ImageService) GetCacheStats() map[string]interface{} {
 // SetDebug enables or disables debug logging
 func (s *ImageService) SetDebug(debug bool) {
 	s.debug = debug
+}
+
+// PreferredCoverURL returns the best available cover image URL for a song
+func (is *ImageService) PreferredCoverURL(song *types.Song) string {
+	if song == nil {
+		return ""
+	}
+
+	// Prefer cropped image if available
+	if song.ImageCropped != nil && *song.ImageCropped != "" {
+		return *song.ImageCropped
+	}
+
+	// Fallback to regular image
+	if song.Image != nil && *song.Image != "" {
+		return *song.Image
+	}
+
+	// Try album cover if song doesn't have one
+	if song.Album != nil {
+		if song.Album.ImageCropped != nil && *song.Album.ImageCropped != "" {
+			return *song.Album.ImageCropped
+		}
+		if song.Album.Image != nil && *song.Album.Image != "" {
+			return *song.Album.Image
+		}
+	}
+
+	return ""
 }

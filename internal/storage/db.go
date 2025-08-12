@@ -224,6 +224,30 @@ func (d *Database) GetSong(ctx context.Context, slug string) (*types.Song, error
 	return song, nil
 }
 
+func (d *Database) ensureAlbumInTx(ctx context.Context, tx *sql.Tx, slug, name string) error {
+	if slug == "" {
+		return nil
+	}
+
+	var exists int
+	if err := tx.QueryRowContext(ctx, "SELECT 1 FROM albums WHERE slug = ? LIMIT 1", slug).Scan(&exists); err == nil {
+		return nil
+	} else if err != sql.ErrNoRows {
+		return err
+	}
+
+	if name == "" {
+		name = slug
+	} // albums.name is NOT NULL
+	now := time.Now()
+	_, err := tx.ExecContext(ctx, `
+		INSERT OR IGNORE INTO albums (slug, name, created_at, updated_at) 
+		VALUES (?, ?, ?, ?)`,
+		slug, name, now, now,
+	)
+	return err
+}
+
 func (d *Database) SaveSong(ctx context.Context, song *types.Song) error {
 	start := time.Now()
 	err := fmt.Errorf("save song: %w", nil)
@@ -254,6 +278,11 @@ func (d *Database) SaveSong(ctx context.Context, song *types.Song) error {
 			return fmt.Errorf("save album: %w", err)
 		}
 		song.AlbumSlug = song.Album.Slug
+	} else if song.AlbumSlug != "" {
+		// make sure FK target exists
+		if err := d.ensureAlbumInTx(ctx, tx, song.AlbumSlug, ""); err != nil {
+			return fmt.Errorf("ensure album: %w", err)
+		}
 	}
 
 	for _, author := range song.Authors {
@@ -1076,4 +1105,17 @@ func stringToPtr(s string) *string {
 		return nil
 	}
 	return &s
+}
+
+func (d *Database) AddPlayHistory(ctx context.Context, songSlug string, userID *string) error {
+	if err := d.checkClosed(); err != nil {
+		return err
+	}
+
+	_, err := d.db.ExecContext(ctx,
+		`INSERT INTO play_history (song_slug, user_id, played_at, synced, created_at)
+         VALUES (?, ?, CURRENT_TIMESTAMP, false, CURRENT_TIMESTAMP)`,
+		songSlug, userID,
+	)
+	return err
 }

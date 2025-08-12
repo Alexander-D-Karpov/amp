@@ -31,7 +31,20 @@ type Client struct {
 	requestCount  int64
 	errorCount    int64
 	lastRequestAt time.Time
+
+	cfg *config.Config
 }
+
+type SortOption string
+
+const (
+	SortDefault       SortOption = ""
+	SortPlayed        SortOption = "played"
+	SortLikes         SortOption = "likes"
+	SortLikesReversed SortOption = "-likes"
+	SortLength        SortOption = "length"
+	SortUploaded      SortOption = "uploaded"
+)
 
 func NewClient(cfg *config.Config) *Client {
 	retryClient := retryablehttp.NewClient()
@@ -56,6 +69,7 @@ func NewClient(cfg *config.Config) *Client {
 		userAgent:   cfg.API.UserAgent,
 		debug:       cfg.Debug,
 		isAnonymous: cfg.User.IsAnonymous,
+		cfg:         cfg,
 	}
 
 	client.debugLog("API Client initialized - Base URL: %s, Debug: %v, Anonymous: %v",
@@ -155,9 +169,11 @@ func (c *Client) makeRequest(ctx context.Context, method, path string, params ur
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
 
-	if c.token != "" {
+	if c.token != "" && !c.isAnonymous {
 		req.Header.Set("Authorization", "Bearer "+c.token)
 		c.debugLog("Using token: %s...", c.token[:min(len(c.token), 10)])
+	} else if c.isAnonymous {
+		c.debugLog("Anonymous mode: not sending Authorization header")
 	} else {
 		c.debugLog("No authentication token provided")
 	}
@@ -214,10 +230,20 @@ func (c *Client) makeRequest(ctx context.Context, method, path string, params ur
 	return resp, responseBody, nil
 }
 
-func (c *Client) GetAnonymousToken(ctx context.Context) (string, error) {
-	c.debugLog("Requesting anonymous token...")
+func (c *Client) EnsureAnonymousToken(ctx context.Context) (string, error) {
+	if c.token != "" && c.isAnonymous {
+		c.debugLog("Using persisted anonymous token: %s...", c.token[:min(len(c.token), 10)])
+		return c.token, nil
+	}
 
-	_, responseBody, err := c.makeRequest(ctx, "POST", "/music/anon/create/", nil, map[string]interface{}{})
+	if c.cfg != nil && c.cfg.API.Token != "" && c.cfg.User.IsAnonymous {
+		c.debugLog("Adopting anonymous token from config: %s...", c.cfg.API.Token[:min(len(c.cfg.API.Token), 10)])
+		c.SetToken(c.cfg.API.Token)
+		return c.token, nil
+	}
+
+	c.debugLog("Requesting new anonymous token...")
+	_, responseBody, err := c.makeRequest(ctx, "POST", "/music/anon/create/", nil, map[string]any{})
 	if err != nil {
 		c.isAnonymous = true
 		c.token = ""
@@ -227,17 +253,19 @@ func (c *Client) GetAnonymousToken(ctx context.Context) (string, error) {
 	var authResp struct {
 		ID string `json:"id"`
 	}
-
-	if err := json.Unmarshal(responseBody, &authResp); err != nil {
+	if err := json.Unmarshal(responseBody, &authResp); err != nil || authResp.ID == "" {
 		c.isAnonymous = true
 		c.token = ""
+		if err == nil {
+			err = fmt.Errorf("empty token in response")
+		}
 		return "", fmt.Errorf("parse anonymous token response: %w", err)
 	}
 
-	c.token = authResp.ID
+	// Persist the new anon token
 	c.isAnonymous = true
-	c.debugLog("Anonymous token obtained successfully: %s...", authResp.ID[:min(len(authResp.ID), 10)])
-
+	c.SetToken(authResp.ID)
+	c.debugLog("Anonymous token obtained and saved: %s...", authResp.ID[:min(len(authResp.ID), 10)])
 	return authResp.ID, nil
 }
 
@@ -257,6 +285,7 @@ func (c *Client) Authenticate(ctx context.Context, token string) error {
 		return fmt.Errorf("authenticate: %w", err)
 	}
 
+	c.SetToken(token)
 	c.debugLog("Authentication successful")
 	return nil
 }
@@ -279,7 +308,11 @@ func (c *Client) GetCurrentUser(ctx context.Context) (*types.User, error) {
 }
 
 func (c *Client) GetSongs(ctx context.Context, page int, search string) (*types.SongListResponse, error) {
-	c.debugLog("Getting songs - page: %d, search: '%s'", page, search)
+	return c.GetSongsWithSort(ctx, page, search, SortDefault)
+}
+
+func (c *Client) GetSongsWithSort(ctx context.Context, page int, search string, sortOption SortOption) (*types.SongListResponse, error) {
+	c.debugLog("Getting songs - page: %d, search: '%s', sort: '%s'", page, search, sortOption)
 
 	params := url.Values{}
 	if page > 0 {
@@ -287,6 +320,9 @@ func (c *Client) GetSongs(ctx context.Context, page int, search string) (*types.
 	}
 	if search != "" {
 		params.Set("search", search)
+	}
+	if sortOption != SortDefault {
+		params.Set("sort", string(sortOption))
 	}
 
 	_, responseBody, err := c.makeRequest(ctx, "GET", "/music/song/", params, nil)
@@ -306,7 +342,7 @@ func (c *Client) GetSongs(ctx context.Context, page int, search string) (*types.
 func (c *Client) GetSong(ctx context.Context, slug string) (*types.Song, error) {
 	c.debugLog("Getting song: %s", slug)
 
-	_, responseBody, err := c.makeRequest(ctx, "GET", "/music/song/"+slug+"/", nil, nil)
+	_, responseBody, err := c.makeRequest(ctx, "GET", "/music/song/"+slug, nil, nil)
 	if err != nil {
 		return nil, fmt.Errorf("get song: %w", err)
 	}
@@ -348,7 +384,7 @@ func (c *Client) GetAlbums(ctx context.Context, page int, search string) (*types
 func (c *Client) GetAlbum(ctx context.Context, slug string) (*types.Album, error) {
 	c.debugLog("Getting album: %s", slug)
 
-	_, responseBody, err := c.makeRequest(ctx, "GET", "/music/albums/"+slug+"/", nil, nil)
+	_, responseBody, err := c.makeRequest(ctx, "GET", "/music/albums/"+slug, nil, nil)
 	if err != nil {
 		return nil, fmt.Errorf("get album: %w", err)
 	}
@@ -390,7 +426,7 @@ func (c *Client) GetAuthors(ctx context.Context, page int, search string) (*type
 func (c *Client) GetAuthor(ctx context.Context, slug string) (*types.Author, error) {
 	c.debugLog("Getting author: %s", slug)
 
-	_, responseBody, err := c.makeRequest(ctx, "GET", "/music/authors/"+slug+"/", nil, nil)
+	_, responseBody, err := c.makeRequest(ctx, "GET", "/music/authors/"+slug, nil, nil)
 	if err != nil {
 		return nil, fmt.Errorf("get author: %w", err)
 	}
@@ -424,7 +460,7 @@ func (c *Client) GetPlaylists(ctx context.Context) ([]*types.Playlist, error) {
 func (c *Client) GetPlaylist(ctx context.Context, slug string) (*types.Playlist, error) {
 	c.debugLog("Getting playlist: %s", slug)
 
-	_, responseBody, err := c.makeRequest(ctx, "GET", "/music/playlists/"+slug+"/", nil, nil)
+	_, responseBody, err := c.makeRequest(ctx, "GET", "/music/playlists/"+slug, nil, nil)
 	if err != nil {
 		return nil, fmt.Errorf("get playlist: %w", err)
 	}
@@ -457,7 +493,7 @@ func (c *Client) CreatePlaylist(ctx context.Context, playlist *types.Playlist) e
 func (c *Client) UpdatePlaylist(ctx context.Context, playlist *types.Playlist) error {
 	c.debugLog("Updating playlist: %s", playlist.Name)
 
-	_, responseBody, err := c.makeRequest(ctx, "PUT", "/music/playlists/"+playlist.Slug+"/", nil, playlist)
+	_, responseBody, err := c.makeRequest(ctx, "PUT", "/music/playlists/"+playlist.Slug, nil, playlist)
 	if err != nil {
 		return fmt.Errorf("update playlist: %w", err)
 	}
@@ -473,7 +509,7 @@ func (c *Client) UpdatePlaylist(ctx context.Context, playlist *types.Playlist) e
 func (c *Client) DeletePlaylist(ctx context.Context, slug string) error {
 	c.debugLog("Deleting playlist: %s", slug)
 
-	_, _, err := c.makeRequest(ctx, "DELETE", "/music/playlists/"+slug+"/", nil, nil)
+	_, _, err := c.makeRequest(ctx, "DELETE", "/music/playlists/"+slug, nil, nil)
 	if err != nil {
 		return fmt.Errorf("delete playlist: %w", err)
 	}
@@ -511,21 +547,23 @@ func (c *Client) DislikeSong(ctx context.Context, slug string) error {
 func (c *Client) ListenSong(ctx context.Context, slug string, userID string) error {
 	c.debugLog("Recording listen for song: %s, user: %s", slug, userID)
 
-	data := map[string]string{
-		"song": slug,
+	// user_id must be the anon token when anonymous, otherwise null
+	payload := map[string]interface{}{
+		"song":    slug,
+		"user_id": nil,
+	}
+	if c.isAnonymous {
+		if userID != "" {
+			payload["user_id"] = userID
+		} else if c.token != "" {
+			payload["user_id"] = c.token // anon id
+		}
 	}
 
-	if userID != "" {
-		data["user_id"] = userID
-	} else if c.isAnonymous && c.token != "" {
-		data["user_id"] = c.token
-	}
-
-	_, _, err := c.makeRequest(ctx, "POST", "/music/song/listen/", nil, data)
+	_, _, err := c.makeRequest(ctx, "POST", "/music/song/listen/", nil, payload)
 	if err != nil {
 		return fmt.Errorf("listen song: %w", err)
 	}
-
 	c.debugLog("Listen recorded successfully for song: %s", slug)
 	return nil
 }

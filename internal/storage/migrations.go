@@ -98,15 +98,22 @@ CREATE TABLE IF NOT EXISTS playlist_songs (
 	FOREIGN KEY (song_slug) REFERENCES songs(slug) ON DELETE CASCADE
 );
 
+
 CREATE TABLE IF NOT EXISTS play_history (
-	id INTEGER PRIMARY KEY AUTOINCREMENT,
-	song_slug TEXT NOT NULL,
-	user_id TEXT,
-	played_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-	synced BOOLEAN DEFAULT FALSE,
-	created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-	FOREIGN KEY (song_slug) REFERENCES songs(slug) ON DELETE CASCADE
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    song_slug TEXT NOT NULL,
+    user_id TEXT,
+    played_at DATETIME NOT NULL,
+    synced BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (song_slug) REFERENCES songs(slug)
 );
+
+CREATE INDEX IF NOT EXISTS idx_play_history_song_slug ON play_history(song_slug);
+CREATE INDEX IF NOT EXISTS idx_play_history_user_id ON play_history(user_id);
+CREATE INDEX IF NOT EXISTS idx_play_history_played_at ON play_history(played_at);
+CREATE INDEX IF NOT EXISTS idx_play_history_synced ON play_history(synced);
+CREATE INDEX IF NOT EXISTS idx_play_history_sync_query ON play_history(synced, played_at);
 
 CREATE TABLE IF NOT EXISTS download_items (
 	url TEXT PRIMARY KEY,
@@ -143,10 +150,6 @@ CREATE INDEX IF NOT EXISTS idx_album_artists_author ON album_artists(author_slug
 
 CREATE INDEX IF NOT EXISTS idx_playlist_songs_playlist ON playlist_songs(playlist_slug);
 CREATE INDEX IF NOT EXISTS idx_playlist_songs_position ON playlist_songs(playlist_slug, position);
-
-CREATE INDEX IF NOT EXISTS idx_play_history_song ON play_history(song_slug);
-CREATE INDEX IF NOT EXISTS idx_play_history_synced ON play_history(synced);
-CREATE INDEX IF NOT EXISTS idx_play_history_played_at ON play_history(played_at);
 
 CREATE INDEX IF NOT EXISTS idx_cache_entries_url ON cache_entries(url);
 CREATE INDEX IF NOT EXISTS idx_cache_entries_accessed_at ON cache_entries(accessed_at);

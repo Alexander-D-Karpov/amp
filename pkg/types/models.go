@@ -1,6 +1,7 @@
 package types
 
 import (
+	"context"
 	"time"
 )
 
@@ -167,4 +168,15 @@ type CacheEntry struct {
 	Size       int64     `db:"size"`
 	AccessedAt time.Time `db:"accessed_at"`
 	CreatedAt  time.Time `db:"created_at"`
+}
+
+type Storage interface {
+	GetSong(ctx context.Context, slug string) (*Song, error)
+	SearchSongs(ctx context.Context, query string, limit int) ([]*Song, error)
+	GetAlbum(ctx context.Context, slug string) (*Album, error)
+	GetAuthor(ctx context.Context, slug string) (*Author, error)
+	GetPlaylist(ctx context.Context, slug string) (*Playlist, error)
+	GetSongs(ctx context.Context, limit, offset int) ([]*Song, error)
+	GetAlbums(ctx context.Context, limit, offset int) ([]*Album, error)
+	GetAuthors(ctx context.Context, limit, offset int) ([]*Author, error)
 }

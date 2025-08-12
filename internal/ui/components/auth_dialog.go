@@ -78,19 +78,6 @@ func (ad *AuthDialog) createDialog(parent fyne.Window) {
 		headerIcon,
 		headerLabel,
 	)
-
-	instructions := widget.NewRichTextFromMarkdown(`
-**To use AMP Music Player:**
-
-1. Go to your account settings
-2. Generate an API token with music permissions
-3. Copy and paste it below
-4. Click Login
-
-Your token will be stored securely and used for all API requests.
-`)
-	instructions.Wrapping = fyne.TextWrapWord
-
 	inputSection := container.NewVBox(
 		widget.NewLabel("API Token:"),
 		ad.tokenEntry,
@@ -100,7 +87,6 @@ Your token will be stored securely and used for all API requests.
 
 	helpSection := container.NewVBox(
 		widget.NewSeparator(),
-		widget.NewLabel("Need help?"),
 		ad.helpLink,
 	)
 
@@ -111,8 +97,6 @@ Your token will be stored securely and used for all API requests.
 
 	content := container.NewVBox(
 		header,
-		widget.NewSeparator(),
-		instructions,
 		widget.NewSeparator(),
 		inputSection,
 		helpSection,

@@ -110,14 +110,6 @@ func (sm *SyncManager) Start(ctx context.Context) {
 			sm.debugLog("Sync manager stopped")
 		}()
 
-		sm.debugLog("Initial sync starting...")
-		if err := sm.FullSync(ctx); err != nil {
-			sm.debugLog("Initial sync failed: %v", err)
-			if sm.onError != nil {
-				sm.onError(err)
-			}
-		}
-
 		for {
 			select {
 			case <-ctx.Done():
@@ -126,14 +118,6 @@ func (sm *SyncManager) Start(ctx context.Context) {
 			case <-sm.stop:
 				sm.debugLog("Sync manager stopping due to stop signal")
 				return
-			case <-sm.ticker.C:
-				sm.debugLog("Periodic sync starting...")
-				if err := sm.FullSync(ctx); err != nil {
-					sm.debugLog("Periodic sync failed: %v", err)
-					if sm.onError != nil {
-						sm.onError(err)
-					}
-				}
 			}
 		}
 	}()
@@ -231,22 +215,27 @@ func (sm *SyncManager) syncSongs(ctx context.Context, stats *SyncStats) error {
 	sm.debugLog("--- Syncing Songs ---")
 
 	page := 1
+	pagesFetched := 0
+	limit := sm.cfg.Storage.MaxSyncPages
 	totalSynced := 0
 
-	for {
-		sm.debugLog("Fetching songs page %d...", page)
+	sm.debugLog("Starting songs sync with page limit: %d", limit)
 
+	for {
+		if limit > 0 && pagesFetched >= limit {
+			sm.debugLog("Songs page limit reached (%d), stopping.", limit)
+			break
+		}
+
+		sm.debugLog("Fetching songs page %d...", page)
 		resp, err := sm.api.GetSongs(ctx, page, "")
 		if err != nil {
 			return fmt.Errorf("get songs page %d: %w", page, err)
 		}
-
 		if len(resp.Results) == 0 {
 			sm.debugLog("No more songs to sync")
 			break
 		}
-
-		sm.debugLog("Processing %d songs from page %d", len(resp.Results), page)
 
 		for i, song := range resp.Results {
 			select {
@@ -254,35 +243,33 @@ func (sm *SyncManager) syncSongs(ctx context.Context, stats *SyncStats) error {
 				return ctx.Err()
 			default:
 			}
-
 			song.LastSync = time.Now()
 			if err := sm.storage.SaveSong(ctx, song); err != nil {
 				sm.debugLog("Failed to save song %s: %v", song.Slug, err)
-				stats.Errors = append(stats.Errors, fmt.Sprintf("Failed to save song %s: %v", song.Name, err))
+				stats.Errors = append(stats.Errors, fmt.Sprintf("save song %s: %v", song.Name, err))
 				continue
 			}
-
 			totalSynced++
-			sm.debugLog("Saved song %d/%d: %s", i+1, len(resp.Results), song.Name)
+			if (i+1)%50 == 0 {
+				time.Sleep(50 * time.Millisecond)
+			}
 		}
 
+		pagesFetched++
 		if resp.Next == nil {
 			break
 		}
-
 		nextPage := extractPageFromURL(*resp.Next)
 		if nextPage <= page {
 			break
 		}
 		page = nextPage
-
 		time.Sleep(100 * time.Millisecond)
 	}
 
 	stats.SongsSynced = totalSynced
 	stats.SongsTotal = totalSynced
-	sm.debugLog("Songs sync completed: %d songs synced", totalSynced)
-
+	sm.debugLog("Songs sync completed: %d synced (pages: %d)", totalSynced, pagesFetched)
 	return nil
 }
 
@@ -290,9 +277,15 @@ func (sm *SyncManager) syncAlbums(ctx context.Context, stats *SyncStats) error {
 	sm.debugLog("--- Syncing Albums ---")
 
 	page := 1
+	pagesFetched := 0
+	limit := sm.cfg.Storage.MaxSyncPages
 	totalSynced := 0
 
 	for {
+		if limit > 0 && pagesFetched >= limit {
+			sm.debugLog("Albums page limit reached (%d), stopping.", limit)
+			break
+		}
 		sm.debugLog("Fetching albums page %d...", page)
 
 		resp, err := sm.api.GetAlbums(ctx, page, "")
@@ -336,6 +329,7 @@ func (sm *SyncManager) syncAlbums(ctx context.Context, stats *SyncStats) error {
 		page = nextPage
 
 		time.Sleep(100 * time.Millisecond)
+		pagesFetched++
 	}
 
 	stats.AlbumsSynced = totalSynced
@@ -349,9 +343,15 @@ func (sm *SyncManager) syncAuthors(ctx context.Context, stats *SyncStats) error 
 	sm.debugLog("--- Syncing Authors ---")
 
 	page := 1
+	pagesFetched := 0
+	limit := sm.cfg.Storage.MaxSyncPages
 	totalSynced := 0
 
 	for {
+		if limit > 0 && pagesFetched >= limit {
+			sm.debugLog("Authors page limit reached (%d), stopping.", limit)
+			break
+		}
 		sm.debugLog("Fetching authors page %d...", page)
 
 		resp, err := sm.api.GetAuthors(ctx, page, "")
@@ -395,6 +395,7 @@ func (sm *SyncManager) syncAuthors(ctx context.Context, stats *SyncStats) error 
 		page = nextPage
 
 		time.Sleep(100 * time.Millisecond)
+		pagesFetched++
 	}
 
 	stats.AuthorsSynced = totalSynced

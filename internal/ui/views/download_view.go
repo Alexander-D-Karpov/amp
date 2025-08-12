@@ -2,6 +2,9 @@ package views
 
 import (
 	"fmt"
+	"log"
+	"path/filepath"
+	"strings"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/container"
@@ -18,12 +21,26 @@ type DownloadsView struct {
 	downloadsList   *widget.List
 	statusLabel     *widget.Label
 	clearBtn        *widget.Button
+	pauseAllBtn     *widget.Button
+	resumeAllBtn    *widget.Button
 	downloads       []*types.DownloadProgress
+	debug           bool
+}
+
+type downloadItemComponents struct {
+	nameLabel     *widget.Label
+	progressBar   *widget.ProgressBar
+	statusLabel   *widget.Label
+	speedLabel    *widget.Label
+	retryBtn      *widget.Button
+	cancelBtn     *widget.Button
+	mainContainer *fyne.Container
 }
 
 func NewDownloadsView(downloadManager *download.Manager) *DownloadsView {
 	dv := &DownloadsView{
 		downloadManager: downloadManager,
+		debug:           true,
 	}
 
 	dv.setupWidgets()
@@ -34,6 +51,8 @@ func NewDownloadsView(downloadManager *download.Manager) *DownloadsView {
 
 func (dv *DownloadsView) setupWidgets() {
 	dv.clearBtn = widget.NewButtonWithIcon("Clear Completed", theme.DeleteIcon(), dv.clearCompleted)
+	dv.pauseAllBtn = widget.NewButtonWithIcon("Pause All", theme.MediaPauseIcon(), dv.pauseAll)
+	dv.resumeAllBtn = widget.NewButtonWithIcon("Resume All", theme.MediaPlayIcon(), dv.resumeAll)
 	dv.statusLabel = widget.NewLabel("No active downloads")
 
 	dv.downloadsList = widget.NewList(
@@ -44,47 +63,229 @@ func (dv *DownloadsView) setupWidgets() {
 			return dv.createDownloadItem()
 		},
 		func(id widget.ListItemID, obj fyne.CanvasObject) {
-			dv.updateDownloadItem(id, obj)
+			if err := dv.updateDownloadItem(id, obj); err != nil && dv.debug {
+				log.Printf("[DOWNLOADS_VIEW] Failed to update download item %d: %v", id, err)
+			}
 		},
 	)
 }
 
 func (dv *DownloadsView) createDownloadItem() fyne.CanvasObject {
 	fileIcon := widget.NewIcon(theme.DocumentIcon())
+	fileIcon.Resize(fyne.NewSize(32, 32))
+
 	nameLabel := widget.NewLabel("Filename")
 	nameLabel.TextStyle = fyne.TextStyle{Bold: true}
-	progressBar := widget.NewProgressBar()
-	statusLabel := widget.NewLabel("Pending")
+	nameLabel.Truncation = fyne.TextTruncateEllipsis
 
-	info := container.NewVBox(nameLabel, progressBar, statusLabel)
-	return container.NewBorder(nil, nil, fileIcon, nil, info)
+	progressBar := widget.NewProgressBar()
+	progressBar.SetValue(0.0)
+
+	statusLabel := widget.NewLabel("Pending")
+	speedLabel := widget.NewLabel("")
+	speedLabel.TextStyle = fyne.TextStyle{Italic: true}
+
+	cancelBtn := widget.NewButtonWithIcon("", theme.CancelIcon(), nil)
+	cancelBtn.Resize(fyne.NewSize(24, 24))
+
+	retryBtn := widget.NewButtonWithIcon("", theme.ViewRefreshIcon(), nil)
+	retryBtn.Resize(fyne.NewSize(24, 24))
+	retryBtn.Hide()
+
+	actionsContainer := container.NewHBox(retryBtn, cancelBtn)
+	progressContainer := container.NewVBox(progressBar, container.NewHBox(statusLabel, speedLabel))
+	infoContainer := container.NewVBox(nameLabel, progressContainer)
+
+	mainContainer := container.NewBorder(nil, nil, fileIcon, actionsContainer, infoContainer)
+
+	return mainContainer
 }
 
-func (dv *DownloadsView) updateDownloadItem(id widget.ListItemID, obj fyne.CanvasObject) {
+func (dv *DownloadsView) updateDownloadItem(id widget.ListItemID, obj fyne.CanvasObject) error {
 	if id >= len(dv.downloads) {
-		return
+		return fmt.Errorf("id %d out of range (len=%d)", id, len(dv.downloads))
 	}
 
 	progress := dv.downloads[id]
-	c := obj.(*fyne.Container)
+	if progress == nil {
+		return fmt.Errorf("nil progress at id %d", id)
+	}
 
-	if len(c.Objects) >= 2 {
-		info := c.Objects[1].(*fyne.Container)
-		if len(info.Objects) >= 3 {
-			nameLabel := info.Objects[0].(*widget.Label)
-			progressBar := info.Objects[1].(*widget.ProgressBar)
-			statusLabel := info.Objects[2].(*widget.Label)
+	mainContainer, ok := obj.(*fyne.Container)
+	if !ok {
+		return fmt.Errorf("expected *fyne.Container, got %T", obj)
+	}
 
-			nameLabel.SetText(extractFilename(progress.URL))
-			progressBar.SetValue(progress.Progress / 100.0)
-			statusLabel.SetText(progress.Status.String())
+	// Extract widgets from the container structure
+	components := dv.extractWidgetsFromContainer(mainContainer)
+	if components == nil {
+		return fmt.Errorf("could not extract widgets from container")
+	}
+
+	// Update filename
+	filename := extractFilename(progress.URL)
+	if progress.Filename != "" {
+		filename = progress.Filename
+	}
+	components.nameLabel.SetText(filename)
+
+	// Update progress bar
+	components.progressBar.SetValue(progress.Progress / 100.0)
+
+	// Update status
+	components.statusLabel.SetText(progress.Status.String())
+
+	// Update speed
+	speedText := ""
+	if progress.Speed > 0 && progress.Status == types.DownloadStatusDownloading {
+		if progress.Speed > 1024*1024 {
+			speedText = fmt.Sprintf("%.1f MB/s", progress.Speed/(1024*1024))
+		} else if progress.Speed > 1024 {
+			speedText = fmt.Sprintf("%.1f KB/s", progress.Speed/1024)
+		} else {
+			speedText = fmt.Sprintf("%.0f B/s", progress.Speed)
 		}
+	}
+	components.speedLabel.SetText(speedText)
+
+	// Update action buttons
+	switch progress.Status {
+	case types.DownloadStatusFailed:
+		components.retryBtn.Show()
+		components.cancelBtn.SetIcon(theme.DeleteIcon())
+		components.retryBtn.OnTapped = func() {
+			if dv.debug {
+				log.Printf("[DOWNLOADS_VIEW] Retry requested for: %s", progress.Filename)
+			}
+		}
+		components.cancelBtn.OnTapped = func() {
+			dv.removeDownload(progress.URL)
+		}
+
+	case types.DownloadStatusDownloading:
+		components.retryBtn.Hide()
+		components.cancelBtn.SetIcon(theme.CancelIcon())
+		components.cancelBtn.OnTapped = func() {
+			dv.downloadManager.Cancel(progress.URL)
+		}
+
+	case types.DownloadStatusCompleted:
+		components.retryBtn.Hide()
+		components.cancelBtn.SetIcon(theme.DeleteIcon())
+		components.cancelBtn.OnTapped = func() {
+			dv.removeDownload(progress.URL)
+		}
+
+	default:
+		components.retryBtn.Hide()
+		components.cancelBtn.SetIcon(theme.CancelIcon())
+		components.cancelBtn.OnTapped = func() {
+			dv.downloadManager.Cancel(progress.URL)
+		}
+	}
+
+	return nil
+}
+
+func (dv *DownloadsView) extractWidgetsFromContainer(container *fyne.Container) *downloadItemComponents {
+	if len(container.Objects) < 3 {
+		return nil
+	}
+
+	// Get the info container (center of border)
+	var infoContainer *fyne.Container
+	var actionsContainer *fyne.Container
+
+	// Find the info and actions containers
+	for _, obj := range container.Objects {
+		if cont, ok := obj.(*fyne.Container); ok {
+			if len(cont.Objects) >= 2 {
+				// Check if this looks like the info container (has label + progress container)
+				if _, isLabel := cont.Objects[0].(*widget.Label); isLabel {
+					infoContainer = cont
+				} else if len(cont.Objects) == 2 {
+					// Check if this looks like actions container (has 2 buttons)
+					if _, isBtn1 := cont.Objects[0].(*widget.Button); isBtn1 {
+						if _, isBtn2 := cont.Objects[1].(*widget.Button); isBtn2 {
+							actionsContainer = cont
+						}
+					}
+				}
+			}
+		}
+	}
+
+	if infoContainer == nil || actionsContainer == nil {
+		return nil
+	}
+
+	// Extract name label (first object in info container)
+	nameLabel, ok := infoContainer.Objects[0].(*widget.Label)
+	if !ok {
+		return nil
+	}
+
+	// Extract progress container (second object in info container)
+	progressContainer, ok := infoContainer.Objects[1].(*fyne.Container)
+	if !ok || len(progressContainer.Objects) < 2 {
+		return nil
+	}
+
+	// Extract progress bar (first object in progress container)
+	progressBar, ok := progressContainer.Objects[0].(*widget.ProgressBar)
+	if !ok {
+		return nil
+	}
+
+	// Extract status container (second object in progress container)
+	statusContainer, ok := progressContainer.Objects[1].(*fyne.Container)
+	if !ok || len(statusContainer.Objects) < 2 {
+		return nil
+	}
+
+	// Extract status and speed labels
+	statusLabel, ok := statusContainer.Objects[0].(*widget.Label)
+	if !ok {
+		return nil
+	}
+
+	speedLabel, ok := statusContainer.Objects[1].(*widget.Label)
+	if !ok {
+		return nil
+	}
+
+	// Extract buttons from actions container
+	retryBtn, ok := actionsContainer.Objects[0].(*widget.Button)
+	if !ok {
+		return nil
+	}
+
+	cancelBtn, ok := actionsContainer.Objects[1].(*widget.Button)
+	if !ok {
+		return nil
+	}
+
+	return &downloadItemComponents{
+		nameLabel:     nameLabel,
+		progressBar:   progressBar,
+		statusLabel:   statusLabel,
+		speedLabel:    speedLabel,
+		retryBtn:      retryBtn,
+		cancelBtn:     cancelBtn,
+		mainContainer: container,
 	}
 }
 
 func (dv *DownloadsView) setupLayout() {
+	controlsContainer := container.NewHBox(
+		dv.clearBtn,
+		widget.NewSeparator(),
+		dv.pauseAllBtn,
+		dv.resumeAllBtn,
+	)
+
 	header := container.NewVBox(
-		container.NewHBox(dv.clearBtn),
+		controlsContainer,
 		dv.statusLabel,
 		widget.NewSeparator(),
 	)
@@ -95,9 +296,19 @@ func (dv *DownloadsView) setupLayout() {
 
 func (dv *DownloadsView) setupEventHandlers() {
 	dv.downloadManager.OnProgress(func(progress *types.DownloadProgress) {
-		dv.refreshDownloads()
-		dv.updateStatus()
+		fyne.Do(func() {
+			dv.refreshDownloads()
+			dv.updateStatus()
+		})
 	})
+
+	dv.downloadManager.OnCompletion(func(task *download.Task) {
+		fyne.Do(func() {
+			dv.refreshDownloads()
+			dv.updateStatus()
+		})
+	})
+
 	dv.refreshDownloads()
 }
 
@@ -113,7 +324,7 @@ func (dv *DownloadsView) updateStatus() {
 
 	for _, download := range dv.downloads {
 		switch download.Status {
-		case types.DownloadStatusDownloading:
+		case types.DownloadStatusDownloading, types.DownloadStatusPending:
 			active++
 		case types.DownloadStatusCompleted:
 			completed++
@@ -122,22 +333,46 @@ func (dv *DownloadsView) updateStatus() {
 		}
 	}
 
+	var statusText string
 	if active > 0 {
-		dv.statusLabel.SetText(fmt.Sprintf("%d active, %d completed, %d failed", active, completed, failed))
+		statusText = fmt.Sprintf("%d active, %d completed, %d failed", active, completed, failed)
 	} else if len(dv.downloads) == 0 {
-		dv.statusLabel.SetText("No downloads")
+		statusText = "No downloads"
 	} else {
-		dv.statusLabel.SetText(fmt.Sprintf("%d completed, %d failed", completed, failed))
+		statusText = fmt.Sprintf("%d completed, %d failed", completed, failed)
 	}
+
+	dv.statusLabel.SetText(statusText)
 }
 
 func (dv *DownloadsView) clearCompleted() {
 	dv.downloadManager.ClearCompleted()
 	dv.refreshDownloads()
+	dv.updateStatus()
+}
+
+func (dv *DownloadsView) pauseAll() {
+	if dv.debug {
+		log.Printf("[DOWNLOADS_VIEW] Pause all requested")
+	}
+}
+
+func (dv *DownloadsView) resumeAll() {
+	if dv.debug {
+		log.Printf("[DOWNLOADS_VIEW] Resume all requested")
+	}
+}
+
+func (dv *DownloadsView) removeDownload(url string) {
+	if dv.debug {
+		log.Printf("[DOWNLOADS_VIEW] Remove download requested for: %s", url)
+	}
+	dv.refreshDownloads()
 }
 
 func (dv *DownloadsView) Refresh() {
 	dv.refreshDownloads()
+	dv.updateStatus()
 }
 
 func (dv *DownloadsView) Container() *fyne.Container {
@@ -149,34 +384,19 @@ func extractFilename(url string) string {
 		return "Unknown"
 	}
 
-	lastSlash := -1
-	for i := len(url) - 1; i >= 0; i-- {
-		if url[i] == '/' {
-			lastSlash = i
-			break
-		}
-	}
+	filename := filepath.Base(url)
 
-	if lastSlash == -1 || lastSlash == len(url)-1 {
-		return "download"
-	}
-
-	filename := url[lastSlash+1:]
-	if queryIndex := findChar(filename, '?'); queryIndex != -1 {
+	if queryIndex := strings.Index(filename, "?"); queryIndex != -1 {
 		filename = filename[:queryIndex]
 	}
 
-	if filename == "" {
+	if fragmentIndex := strings.Index(filename, "#"); fragmentIndex != -1 {
+		filename = filename[:fragmentIndex]
+	}
+
+	if filename == "." || filename == "/" || filename == "" {
 		return "download"
 	}
-	return filename
-}
 
-func findChar(str string, char rune) int {
-	for i, c := range str {
-		if c == char {
-			return i
-		}
-	}
-	return -1
+	return filename
 }

@@ -3,6 +3,7 @@ package views
 import (
 	"context"
 	"fmt"
+	"github.com/Alexander-D-Karpov/amp/internal/download"
 	"log"
 	"sort"
 	"strings"
@@ -14,6 +15,7 @@ import (
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 
+	"github.com/Alexander-D-Karpov/amp/internal/api"
 	"github.com/Alexander-D-Karpov/amp/internal/handlers"
 	"github.com/Alexander-D-Karpov/amp/internal/services"
 	"github.com/Alexander-D-Karpov/amp/internal/ui/components"
@@ -21,20 +23,30 @@ import (
 )
 
 type SongsView struct {
-	musicService *services.MusicService
-	imageService *services.ImageService
-	handlers     *handlers.UIHandlers
+	musicService    *services.MusicService
+	imageService    *services.ImageService
+	downloadManager *download.Manager
+	handlers        *handlers.UIHandlers
 
-	container       *fyne.Container
-	mediaGrid       *components.MediaGrid
-	searchEntry     *widget.Entry
-	refreshBtn      *widget.Button
-	viewToggleBtn   *widget.Button
-	sortSelect      *widget.Select
-	filterSelect    *widget.Select
-	loader          *widget.ProgressBarInfinite
-	statusLabel     *widget.Label
-	scrollContainer *container.Scroll
+	container *fyne.Container
+
+	mediaGrid   *components.MediaGrid
+	songList    *components.SongList
+	gridScroll  *container.Scroll
+	listScroll  *container.Scroll
+	centerStack *fyne.Container
+
+	searchEntry   *widget.Entry
+	refreshBtn    *widget.Button
+	viewToggleBtn *widget.Button
+	sortSelect    *widget.Select
+	filterSelect  *widget.Select
+	loader        *widget.ProgressBarInfinite
+	statusLabel   *widget.Label
+
+	contextMenu    *components.ContextMenu
+	lastTappedSong *types.Song
+	parentWindow   fyne.Window
 
 	mu            sync.RWMutex
 	songs         []*types.Song
@@ -50,6 +62,13 @@ type SongsView struct {
 	lastSearch    string
 	debug         bool
 	searchCache   map[string][]*types.Song
+	currentSort   api.SortOption
+
+	onDownload       func(*types.Song)
+	onAddPlaylist    func(*types.Song)
+	openAlbumBySlug  func(string)
+	openAuthorBySlug func(string)
+	openSongBySlug   func(string)
 }
 
 func NewSongsView(musicService *services.MusicService, imageService *services.ImageService, handlers *handlers.UIHandlers) *SongsView {
@@ -65,12 +84,17 @@ func NewSongsView(musicService *services.MusicService, imageService *services.Im
 		allSongs:      make([]*types.Song, 0),
 		debug:         true,
 		searchCache:   make(map[string][]*types.Song),
+		currentSort:   api.SortDefault,
 	}
 
 	sv.setupWidgets()
 	sv.setupLayout()
 	sv.loadSongs()
 	return sv
+}
+
+func (sv *SongsView) SetParentWindow(window fyne.Window) {
+	sv.parentWindow = window
 }
 
 func (sv *SongsView) setupWidgets() {
@@ -82,7 +106,7 @@ func (sv *SongsView) setupWidgets() {
 	sv.viewToggleBtn = widget.NewButtonWithIcon("", theme.GridIcon(), sv.toggleView)
 
 	sv.sortSelect = widget.NewSelect([]string{
-		"Date Added", "Name A-Z", "Name Z-A", "Artist A-Z", "Duration", "Play Count",
+		"Date Added", "Name A-Z", "Name Z-A", "Artist A-Z", "Duration", "Most Played", "Most Liked", "Least Liked", "Longest", "Newest",
 	}, sv.onSortChanged)
 	sv.sortSelect.SetSelected("Date Added")
 
@@ -91,58 +115,203 @@ func (sv *SongsView) setupWidgets() {
 	}, sv.onFilterChanged)
 	sv.filterSelect.SetSelected("All Songs")
 
-	sv.mediaGrid = components.NewMediaGrid(fyne.NewSize(180, 220), sv.imageService)
+	sv.mediaGrid = components.NewMediaGrid(fyne.NewSize(200, 260), sv.imageService)
 	sv.mediaGrid.SetItemTapCallback(sv.onGridItemTapped)
+	sv.mediaGrid.SetItemSecondaryTapCallback(sv.onGridItemSecondaryTapped)
+
+	sv.songList = components.NewSongList()
+	sv.songList.OnPlay(func(s *types.Song, queue []*types.Song) {
+		if sv.handlers != nil {
+			sv.handlers.HandleSongSelection(s, queue)
+			sv.recordSongPlay(s)
+		}
+	})
+	sv.songList.OnDownload(func(s *types.Song) {
+		if sv.onDownload != nil {
+			sv.onDownload(s)
+		}
+	})
+	sv.songList.OnOpenAlbum(func(slug string) {
+		if sv.openAlbumBySlug != nil {
+			sv.openAlbumBySlug(slug)
+		}
+	})
+	sv.songList.OnOpenAuthor(func(slug string) {
+		if sv.openAuthorBySlug != nil {
+			sv.openAuthorBySlug(slug)
+		}
+	})
+	sv.songList.OnOpenSong(func(slug string) {
+		if sv.openSongBySlug != nil {
+			sv.openSongBySlug(slug)
+		}
+	})
 
 	sv.loader = widget.NewProgressBarInfinite()
 	sv.loader.Hide()
-
 	sv.statusLabel = widget.NewLabel("Loading songs...")
 }
 
 func (sv *SongsView) setupLayout() {
-	searchBar := container.NewBorder(nil, nil, nil,
+	searchBar := container.NewBorder(
+		nil, nil, nil,
 		container.NewHBox(sv.viewToggleBtn, sv.refreshBtn),
-		sv.searchEntry)
-
+		sv.searchEntry,
+	)
 	controls := container.NewHBox(
 		widget.NewLabel("Sort:"), sv.sortSelect,
-		widget.NewLabel("Filter:"), sv.filterSelect)
-
+		widget.NewLabel("Filter:"), sv.filterSelect,
+	)
 	header := container.NewVBox(searchBar, controls, sv.statusLabel)
 
-	sv.scrollContainer = container.NewScroll(sv.mediaGrid)
-	sv.scrollContainer.OnScrolled = sv.onScrolled
+	sv.gridScroll = container.NewScroll(sv.mediaGrid)
+	sv.gridScroll.OnScrolled = sv.onScrolled
 
-	sv.container = container.NewBorder(header, sv.loader, nil, nil, sv.scrollContainer)
+	sv.listScroll = container.NewScroll(sv.songList)
+	sv.listScroll.OnScrolled = sv.onScrolled
+
+	sv.centerStack = container.NewStack(sv.gridScroll, sv.listScroll)
+	sv.listScroll.Hide()
+
+	sv.container = container.NewBorder(header, sv.loader, nil, nil, sv.centerStack)
 }
 
 func (sv *SongsView) onScrolled(pos fyne.Position) {
 	if sv.loadingMore || !sv.hasMore {
 		return
 	}
-
-	scrollSize := sv.scrollContainer.Size()
+	var scrollSize fyne.Size
+	if sv.isGridView {
+		scrollSize = sv.gridScroll.Size()
+	} else {
+		scrollSize = sv.listScroll.Size()
+	}
 	contentSize := sv.mediaGrid.MinSize()
 
 	if pos.Y >= contentSize.Height-scrollSize.Height-100 {
 		if sv.debug {
 			log.Printf("[SONGS_VIEW] Near bottom, loading more songs")
 		}
-		sv.loadMoreSongs()
+		go sv.loadMoreSongs()
 	}
 }
 
 func (sv *SongsView) onGridItemTapped(index int) {
 	sv.mu.RLock()
-	defer sv.mu.RUnlock()
+	if index >= len(sv.filteredSongs) {
+		sv.mu.RUnlock()
+		return
+	}
+	song := sv.filteredSongs[index]
+	sv.mu.RUnlock()
 
-	if index < len(sv.filteredSongs) && sv.handlers != nil {
-		song := sv.filteredSongs[index]
-		if sv.debug {
-			log.Printf("[SONGS_VIEW] Song selected: %s by %s", song.Name, getArtistNames(song.Authors))
-		}
+	sv.lastTappedSong = song
+
+	if sv.debug {
+		log.Printf("[SONGS_VIEW] Song selected: %s by %s", song.Name, getArtistNames(song.Authors))
+	}
+
+	if sv.handlers != nil {
 		sv.handlers.HandleSongSelection(song, sv.filteredSongs)
+		sv.recordSongPlay(song)
+	}
+}
+
+func (sv *SongsView) recordSongPlay(song *types.Song) {
+	if song == nil {
+		return
+	}
+
+	go func() {
+		ctx := context.Background()
+
+		song.Played++
+		if err := sv.musicService.GetStorage().SaveSong(ctx, song); err != nil {
+			log.Printf("[SONGS_VIEW] Failed to update play count for song %s: %v", song.Name, err)
+		}
+
+		if err := sv.musicService.GetStorage().AddPlayHistory(ctx, song.Slug, nil); err != nil {
+			log.Printf("[SONGS_VIEW] Failed to add play history for %s: %v", song.Slug, err)
+		}
+
+		if sv.debug {
+			log.Printf("[SONGS_VIEW] Recorded play for song: %s (total plays: %d)", song.Name, song.Played)
+		}
+	}()
+}
+
+func (sv *SongsView) handlePlaySong(song *types.Song) {
+	if sv.handlers != nil {
+		sv.handlers.HandleSongSelection(song, sv.filteredSongs)
+		sv.recordSongPlay(song)
+	}
+}
+
+func (sv *SongsView) handleLikeSong(song *types.Song) {
+	if song == nil {
+		return
+	}
+
+	liked := song.Liked == nil || !*song.Liked
+	song.Liked = &liked
+
+	if sv.debug {
+		log.Printf("[SONGS_VIEW] Toggled like for song: %s (liked: %v)", song.Name, liked)
+	}
+
+	go func() {
+		ctx := context.Background()
+		if err := sv.musicService.GetStorage().SaveSong(ctx, song); err != nil {
+			log.Printf("[SONGS_VIEW] Failed to save like status: %v", err)
+		}
+
+		fyne.Do(func() {
+			sv.updateGridView()
+		})
+	}()
+}
+
+func (sv *SongsView) handleDownloadSong(song *types.Song) {
+	if song == nil {
+		return
+	}
+
+	if sv.debug {
+		log.Printf("[SONGS_VIEW] Download requested for song: %s", song.Name)
+	}
+
+	if sv.onDownload != nil {
+		sv.onDownload(song)
+		return
+	}
+
+	if sv.handlers != nil && sv.handlers.DownloadManager != nil {
+		go func() {
+			ctx := context.Background()
+			if err := sv.handlers.DownloadManager.DownloadSong(ctx, song); err != nil {
+				log.Printf("[SONGS_VIEW] Download failed for %s: %v", song.Name, err)
+			} else {
+				log.Printf("[SONGS_VIEW] Download started for %s", song.Name)
+			}
+		}()
+	}
+}
+
+func (sv *SongsView) handleAddToPlaylist(song *types.Song) {
+	if song == nil {
+		return
+	}
+
+	if sv.debug {
+		log.Printf("[SONGS_VIEW] Add to playlist requested for song: %s", song.Name)
+	}
+
+	if sv.onAddPlaylist != nil {
+		sv.onAddPlaylist(song)
+	} else {
+		if sv.parentWindow != nil {
+			log.Printf("[SONGS_VIEW] Playlist selection not implemented yet")
+		}
 	}
 }
 
@@ -151,50 +320,50 @@ func (sv *SongsView) toggleView() {
 	fyne.Do(func() {
 		if sv.isGridView {
 			sv.viewToggleBtn.SetIcon(theme.GridIcon())
+			sv.listScroll.Hide()
+			sv.gridScroll.Show()
 		} else {
 			sv.viewToggleBtn.SetIcon(theme.ListIcon())
+			sv.gridScroll.Hide()
+			sv.listScroll.Show()
 		}
 		sv.updateGridView()
 	})
 }
 
 func (sv *SongsView) updateGridView() {
-	if sv.mediaGrid == nil {
-		return
-	}
-
 	sv.mu.RLock()
 	songs := make([]*types.Song, len(sv.filteredSongs))
 	copy(songs, sv.filteredSongs)
 	sv.mu.RUnlock()
 
 	if sv.debug {
-		log.Printf("[SONGS_VIEW] Updating grid with %d songs", len(songs))
+		log.Printf("[SONGS_VIEW] Updating view with %d songs (grid=%v)", len(songs), sv.isGridView)
 	}
 
-	var items []components.MediaItem
-	if len(songs) == 0 {
-		fyne.Do(func() {
-			sv.statusLabel.SetText("No songs found")
-		})
-	} else {
-		fyne.Do(func() {
-			sv.statusLabel.SetText(fmt.Sprintf("Showing %d songs", len(songs)))
-		})
-		items = make([]components.MediaItem, len(songs))
-		for i, song := range songs {
-			if song != nil {
-				items[i] = components.MediaItemFromSong(song)
-				if sv.debug && i < 5 {
-					log.Printf("[SONGS_VIEW] Added song to grid: %s", song.Name)
-				}
+	fyne.Do(func() {
+		if sv.statusLabel != nil {
+			if len(songs) == 0 {
+				sv.statusLabel.SetText("No songs found")
+			} else {
+				sv.statusLabel.SetText(fmt.Sprintf("Showing %d songs", len(songs)))
 			}
 		}
-	}
+	})
 
-	sv.mediaGrid.SetItems(items)
-	if len(songs) > 100 {
-		sv.mediaGrid.SetVirtualScroll(true)
+	if sv.isGridView {
+		items := make([]components.MediaItem, 0, len(songs))
+		for _, song := range songs {
+			if song != nil {
+				items = append(items, components.MediaItemFromSong(song))
+			}
+		}
+		sv.mediaGrid.SetItems(items)
+		if len(songs) > 100 {
+			sv.mediaGrid.SetVirtualScroll(true)
+		}
+	} else {
+		sv.songList.SetSongs(songs)
 	}
 }
 
@@ -212,6 +381,8 @@ func (sv *SongsView) performSearch(query string) {
 	sv.lastSearch = query
 	sv.currentPage = 1
 	sv.hasMore = true
+	sv.songs = make([]*types.Song, 0)
+	sv.allSongs = make([]*types.Song, 0)
 	sv.mu.Unlock()
 
 	if sv.debug {
@@ -219,29 +390,20 @@ func (sv *SongsView) performSearch(query string) {
 	}
 
 	if query == "" {
-		sv.mu.Lock()
-		sv.filteredSongs = make([]*types.Song, len(sv.allSongs))
-		copy(sv.filteredSongs, sv.allSongs)
-		sv.mu.Unlock()
-
-		sv.applySortAndFilter()
-		fyne.Do(func() {
-			sv.updateGridView()
-		})
+		sv.loadSongs()
 		return
 	}
 
-	if cached, exists := sv.searchCache[query]; exists {
+	cacheKey := fmt.Sprintf("%s_%s", query, sv.currentSort)
+	if cached, exists := sv.searchCache[cacheKey]; exists {
 		sv.mu.Lock()
 		sv.songs = cached
-		sv.filteredSongs = make([]*types.Song, len(cached))
-		copy(sv.filteredSongs, cached)
+		sv.allSongs = append([]*types.Song(nil), cached...)
+		sv.filteredSongs = append([]*types.Song(nil), cached...)
 		sv.mu.Unlock()
 
 		sv.applySortAndFilter()
-		fyne.Do(func() {
-			sv.updateGridView()
-		})
+		fyne.Do(func() { sv.updateGridView() })
 		return
 	}
 
@@ -281,10 +443,10 @@ func (sv *SongsView) loadSongsWithSearch(query string) {
 		ctx := context.Background()
 
 		if sv.debug {
-			log.Printf("[SONGS_VIEW] Loading songs with search - query: '%s'", query)
+			log.Printf("[SONGS_VIEW] Loading songs with search - query: '%s', sort: '%s'", query, sv.currentSort)
 		}
 
-		songs, hasMore, err := sv.musicService.GetSongs(ctx, 1, query)
+		songs, hasMore, err := sv.musicService.GetSongsWithSort(ctx, 1, query, sv.currentSort)
 		if err != nil {
 			if sv.debug {
 				log.Printf("[SONGS_VIEW] Error searching songs: %v", err)
@@ -303,31 +465,61 @@ func (sv *SongsView) loadSongsWithSearch(query string) {
 
 		sv.mu.Lock()
 		sv.songs = songs
-		sv.filteredSongs = make([]*types.Song, len(songs))
-		copy(sv.filteredSongs, songs)
+		sv.allSongs = append([]*types.Song(nil), songs...)
+		sv.filteredSongs = append([]*types.Song(nil), songs...)
 		sv.hasMore = hasMore
-		sv.searchCache[query] = songs
+		cacheKey := fmt.Sprintf("%s_%s", query, sv.currentSort)
+		sv.searchCache[cacheKey] = songs
 		sv.applySortAndFilter()
 		sv.mu.Unlock()
 
-		fyne.Do(func() {
-			sv.updateGridView()
-		})
+		fyne.Do(func() { sv.updateGridView() })
 	}()
 }
 
 func (sv *SongsView) onSortChanged(option string) {
-	sv.applySortAndFilter()
-	fyne.Do(func() {
-		sv.updateGridView()
-	})
+	sv.mu.Lock()
+	oldSort := sv.currentSort
+	sv.currentSort = sv.mapSortOption(option)
+	sv.mu.Unlock()
+
+	if oldSort != sv.currentSort {
+		sv.mu.Lock()
+		sv.searchCache = make(map[string][]*types.Song)
+		sv.currentPage = 1
+		sv.hasMore = true
+		sv.songs = nil
+		sv.allSongs = nil
+		sv.mu.Unlock()
+
+		if sv.lastSearch != "" {
+			sv.performSearch(sv.lastSearch)
+		} else {
+			sv.loadSongs()
+		}
+	}
+}
+
+func (sv *SongsView) mapSortOption(option string) api.SortOption {
+	switch option {
+	case "Most Played":
+		return api.SortPlayed
+	case "Most Liked":
+		return api.SortLikes
+	case "Least Liked":
+		return api.SortLikesReversed
+	case "Longest":
+		return api.SortLength
+	case "Newest":
+		return api.SortUploaded
+	default:
+		return api.SortDefault
+	}
 }
 
 func (sv *SongsView) onFilterChanged(filter string) {
 	sv.applySortAndFilter()
-	fyne.Do(func() {
-		sv.updateGridView()
-	})
+	fyne.Do(func() { sv.updateGridView() })
 }
 
 func (sv *SongsView) loadSongs() {
@@ -339,6 +531,7 @@ func (sv *SongsView) loadSongs() {
 	sv.loading = true
 	query := sv.lastSearch
 	page := sv.currentPage
+	sortOption := sv.currentSort
 	sv.mu.Unlock()
 
 	fyne.Do(func() {
@@ -365,10 +558,10 @@ func (sv *SongsView) loadSongs() {
 		ctx := context.Background()
 
 		if sv.debug {
-			log.Printf("[SONGS_VIEW] Loading songs - page: %d, query: '%s'", page, query)
+			log.Printf("[SONGS_VIEW] Loading songs - page: %d, query: '%s', sort: '%s'", page, query, sortOption)
 		}
 
-		songs, hasMore, err := sv.musicService.GetSongs(ctx, page, query)
+		songs, hasMore, err := sv.musicService.GetSongsWithSort(ctx, page, query, sortOption)
 		if err != nil {
 			if sv.debug {
 				log.Printf("[SONGS_VIEW] Error loading songs: %v", err)
@@ -388,8 +581,7 @@ func (sv *SongsView) loadSongs() {
 		sv.mu.Lock()
 		if page == 1 {
 			sv.songs = songs
-			sv.allSongs = make([]*types.Song, len(songs))
-			copy(sv.allSongs, songs)
+			sv.allSongs = append([]*types.Song(nil), songs...)
 		} else {
 			sv.songs = append(sv.songs, songs...)
 			sv.allSongs = append(sv.allSongs, songs...)
@@ -398,9 +590,7 @@ func (sv *SongsView) loadSongs() {
 		sv.applySortAndFilter()
 		sv.mu.Unlock()
 
-		fyne.Do(func() {
-			sv.updateGridView()
-		})
+		fyne.Do(func() { sv.updateGridView() })
 	}()
 }
 
@@ -414,6 +604,7 @@ func (sv *SongsView) loadMoreSongs() {
 	sv.currentPage++
 	page := sv.currentPage
 	query := sv.lastSearch
+	sortOption := sv.currentSort
 	sv.mu.Unlock()
 
 	if sv.debug {
@@ -428,7 +619,7 @@ func (sv *SongsView) loadMoreSongs() {
 		}()
 
 		ctx := context.Background()
-		songs, hasMore, err := sv.musicService.GetSongs(ctx, page, query)
+		songs, hasMore, err := sv.musicService.GetSongsWithSort(ctx, page, query, sortOption)
 		if err != nil {
 			if sv.debug {
 				log.Printf("[SONGS_VIEW] Error loading more songs: %v", err)
@@ -447,25 +638,16 @@ func (sv *SongsView) loadMoreSongs() {
 		sv.applySortAndFilter()
 		sv.mu.Unlock()
 
-		fyne.Do(func() {
-			sv.updateGridView()
-		})
+		fyne.Do(func() { sv.updateGridView() })
 	}()
 }
 
 func (sv *SongsView) applySortAndFilter() {
-	if sv.sortSelect == nil || sv.filterSelect == nil {
-		sv.filteredSongs = sv.songs
-		return
-	}
-
-	filtered := make([]*types.Song, 0)
+	filtered := make([]*types.Song, 0, len(sv.songs))
 	var filter string
-	fyne.Do(func() {
-		if sv.filterSelect != nil {
-			filter = sv.filterSelect.Selected
-		}
-	})
+	if sv.filterSelect != nil {
+		filter = sv.filterSelect.Selected
+	}
 
 	for _, song := range sv.songs {
 		if song == nil {
@@ -488,44 +670,43 @@ func (sv *SongsView) applySortAndFilter() {
 	}
 
 	var sortOpt string
-	fyne.Do(func() {
-		if sv.sortSelect != nil {
-			sortOpt = sv.sortSelect.Selected
-		}
-	})
+	if sv.sortSelect != nil {
+		sortOpt = sv.sortSelect.Selected
+	}
 
-	sort.Slice(filtered, func(i, j int) bool {
-		s1, s2 := filtered[i], filtered[j]
-		if s1 == nil || s2 == nil {
+	if sv.currentSort == api.SortDefault {
+		sort.Slice(filtered, func(i, j int) bool {
+			s1, s2 := filtered[i], filtered[j]
+			if s1 == nil || s2 == nil {
+				return false
+			}
+			switch sortOpt {
+			case "Name A-Z":
+				return strings.ToLower(s1.Name) < strings.ToLower(s2.Name)
+			case "Name Z-A":
+				return strings.ToLower(s1.Name) > strings.ToLower(s2.Name)
+			case "Artist A-Z":
+				return getFirstAuthor(s1) < getFirstAuthor(s2)
+			case "Duration":
+				return s1.Length > s2.Length
+			case "Play Count":
+				return s1.Played > s2.Played
+			case "Date Added", "":
+				return s1.CreatedAt.After(s2.CreatedAt)
+			}
 			return false
-		}
-		switch sortOpt {
-		case "Name A-Z":
-			return strings.ToLower(s1.Name) < strings.ToLower(s2.Name)
-		case "Name Z-A":
-			return strings.ToLower(s1.Name) > strings.ToLower(s2.Name)
-		case "Artist A-Z":
-			return getFirstAuthor(s1) < getFirstAuthor(s2)
-		case "Duration":
-			return s1.Length > s2.Length
-		case "Play Count":
-			return s1.Played > s2.Played
-		case "Date Added", "":
-			return s1.CreatedAt.After(s2.CreatedAt)
-		}
-		return false
-	})
+		})
+	}
 
 	sv.filteredSongs = filtered
 
 	if sv.debug {
-		log.Printf("[SONGS_VIEW] Applied filter '%s' and sort '%s', result: %d songs", filter, sortOpt, len(sv.filteredSongs))
+		log.Printf("[SONGS_VIEW] Applied filter '%s', result: %d songs", filter, len(sv.filteredSongs))
 	}
 }
 
 func (sv *SongsView) SetCompactMode(compact bool) {
 	sv.compactMode = compact
-
 	fyne.Do(func() {
 		sv.mediaGrid.SetCompactMode(compact)
 		sv.updateGridView()
@@ -536,13 +717,12 @@ func (sv *SongsView) Refresh() {
 	if sv.debug {
 		log.Printf("[SONGS_VIEW] Manual refresh requested")
 	}
-
 	sv.mu.Lock()
 	sv.currentPage = 1
 	sv.hasMore = true
-	sv.songs = make([]*types.Song, 0)
-	sv.allSongs = make([]*types.Song, 0)
-	sv.filteredSongs = make([]*types.Song, 0)
+	sv.songs = nil
+	sv.allSongs = nil
+	sv.filteredSongs = nil
 	sv.searchCache = make(map[string][]*types.Song)
 	sv.mu.Unlock()
 
@@ -553,8 +733,36 @@ func (sv *SongsView) Refresh() {
 	}
 }
 
+func (sv *SongsView) SetCallbacks(onDownload func(*types.Song), onAddPlaylist func(*types.Song)) {
+	sv.onDownload = onDownload
+	sv.onAddPlaylist = onAddPlaylist
+}
+
+func (sv *SongsView) SetOpenAlbumBySlug(cb func(string)) {
+	sv.openAlbumBySlug = cb
+	if sv.songList != nil {
+		sv.songList.OnOpenAlbum(cb)
+	}
+}
+func (sv *SongsView) SetOpenAuthorBySlug(cb func(string)) {
+	sv.openAuthorBySlug = cb
+	if sv.songList != nil {
+		sv.songList.OnOpenAuthor(cb)
+	}
+}
+func (sv *SongsView) SetOpenSongBySlug(cb func(string)) {
+	sv.openSongBySlug = cb
+	if sv.songList != nil {
+		sv.songList.OnOpenSong(cb)
+	}
+}
+
 func (sv *SongsView) Container() *fyne.Container {
 	return sv.container
+}
+
+func (sv *SongsView) SetDownloadHandler(handler func(*types.Song)) {
+	sv.onDownload = handler
 }
 
 func getArtistNames(authors []*types.Author) string {
@@ -578,4 +786,59 @@ func getFirstAuthor(s *types.Song) string {
 		return strings.ToLower(s.Authors[0].Name)
 	}
 	return ""
+}
+
+func (sv *SongsView) onGridItemSecondaryTapped(index int, pos fyne.Position) {
+	sv.mu.RLock()
+	if index >= len(sv.filteredSongs) {
+		sv.mu.RUnlock()
+		return
+	}
+	song := sv.filteredSongs[index]
+	sv.mu.RUnlock()
+
+	if sv.debug {
+		log.Printf("[SONGS_VIEW] Secondary tap on song: %s at position %v", song.Name, pos)
+	}
+
+	sv.showContextMenu(song, pos)
+}
+
+func (sv *SongsView) showContextMenu(song *types.Song, pos fyne.Position) {
+	if song == nil || sv.parentWindow == nil {
+		return
+	}
+
+	if sv.debug {
+		log.Printf("[SONGS_VIEW] Showing context menu for song: %s at position %v", song.Name, pos)
+	}
+
+	if sv.contextMenu != nil {
+		sv.contextMenu.Hide()
+	}
+
+	sv.contextMenu = components.NewContextMenu(song, sv.debug)
+
+	sv.contextMenu.SetCallbacks(
+		sv.handlePlaySong,
+		sv.handleLikeSong,
+		sv.handleDownloadSong,
+		sv.handleAddToPlaylist,
+	)
+
+	windowSize := sv.parentWindow.Canvas().Size()
+	if pos.X > windowSize.Width-200 {
+		pos.X = windowSize.Width - 200
+	}
+	if pos.Y > windowSize.Height-150 {
+		pos.Y = windowSize.Height - 150
+	}
+	if pos.X < 0 {
+		pos.X = 10
+	}
+	if pos.Y < 0 {
+		pos.Y = 10
+	}
+
+	sv.contextMenu.ShowAt(sv.parentWindow.Canvas(), pos)
 }

@@ -31,6 +31,7 @@ type Config struct {
 		MaxCacheSize int64  `mapstructure:"max_cache_size"`
 		SyncInterval int    `mapstructure:"sync_interval"`
 		EnableWAL    bool   `mapstructure:"enable_wal"`
+		MaxSyncPages int    `mapstructure:"max_sync_pages"`
 	} `mapstructure:"storage"`
 
 	Audio struct {
@@ -159,6 +160,7 @@ func setDefaults() {
 	viper.SetDefault("storage.max_cache_size", 1024*1024*1024)
 	viper.SetDefault("storage.sync_interval", 300)
 	viper.SetDefault("storage.enable_wal", true)
+	viper.SetDefault("storage.max_sync_pages", 10)
 
 	viper.SetDefault("audio.sample_rate", 44100)
 	viper.SetDefault("audio.buffer_size", getDefaultBufferSize())

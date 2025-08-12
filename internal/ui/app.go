@@ -51,6 +51,7 @@ type Core struct {
 	imageLoader     *media.ImageLoader
 	musicService    *services.MusicService
 	imageService    *services.ImageService
+	playSyncService *services.PlaySyncService
 }
 
 type UIComponents struct {
@@ -114,6 +115,12 @@ func NewApp(ctx context.Context, fyneApp fyne.App, cfg *config.Config) (*App, er
 
 func initCore(cfg *config.Config) (*Core, error) {
 	apiClient := api.NewClient(cfg)
+	if cfg.User.IsAnonymous && cfg.API.Token == "" {
+		if _, err := apiClient.EnsureAnonymousToken(context.Background()); err != nil {
+			log.Printf("anon token create failed: %v", err)
+		}
+	}
+
 	storageDB, err := storage.NewDatabase(cfg)
 	if err != nil {
 		return nil, fmt.Errorf("initialize database: %w", err)
@@ -131,8 +138,8 @@ func initCore(cfg *config.Config) (*Core, error) {
 	syncManager := storage.NewSyncManager(apiClient, storageDB, cfg)
 	musicService := services.NewMusicService(apiClient, storageDB, searchEngine)
 	imageService := services.NewImageService(imageLoader)
+	playSyncService := services.NewPlaySyncService(apiClient, storageDB, cfg, cfg.Debug)
 
-	// Reduce debug logging for services
 	if !cfg.Debug {
 		musicService.SetDebug(false)
 		imageService.SetDebug(false)
@@ -148,24 +155,38 @@ func initCore(cfg *config.Config) (*Core, error) {
 		imageLoader:     imageLoader,
 		musicService:    musicService,
 		imageService:    imageService,
+		playSyncService: playSyncService,
 	}, nil
 }
 
 func (a *App) initUI() error {
 	a.ui = &UIComponents{
-		playerBar:        components.NewPlayerBar(a.core.player, a.core.storage),
+		playerBar:        components.NewPlayerBar(a.core.player, a.core.storage, a.core.imageService, a.cfg.Debug),
 		sidebar:          components.NewSidebar(a.cfg),
 		authDialog:       components.NewAuthDialog(a.core.api),
 		statusBar:        widget.NewLabel("Ready"),
 		loadingIndicator: widget.NewProgressBarInfinite(),
 	}
 
+	a.ui.statusBar.Hide()
+
 	a.ui.playerBar.SetConfig(a.cfg)
-	// Set the parent window for player bar (for volume popup)
 	a.ui.playerBar.SetParentWindow(a.window)
 
+	a.ui.playerBar.OnPrefetchNext(func(s *types.Song) {
+		go func() {
+			if a.cfg.Debug {
+				log.Printf("[APP] Prefetching next song: %s by %s", s.Name, getArtistNames(s.Authors))
+			}
+			if s != nil && s.File != "" {
+				_ = a.core.downloadManager.DownloadSong(context.Background(), s)
+			}
+		}()
+	})
+
 	a.ui.loadingIndicator.Hide()
-	a.ui.mainView = views.NewMainView(a.core.musicService, a.core.imageService, a.core.downloadManager, a.cfg)
+	a.ui.mainView = views.NewMainView(a.core.musicService, a.core.imageService, a.core.downloadManager, a.core.playSyncService, a.cfg)
+	a.ui.mainView.SetParentWindow(a.window)
 
 	a.createLayout()
 	a.window.SetContent(a.mainContainer)
@@ -247,11 +268,11 @@ func (a *App) setupEventHandlers() {
 	})
 
 	a.ui.mainView.OnAlbumSelected(func(album *types.Album) {
-		a.updateStatus(fmt.Sprintf("Selected album: %s", album.Name))
+		a.ui.mainView.OpenAlbumDetail(album)
 	})
 
 	a.ui.mainView.OnArtistSelected(func(artist *types.Author) {
-		a.updateStatus(fmt.Sprintf("Selected artist: %s", artist.Name))
+		a.ui.mainView.OpenAuthorDetail(artist)
 	})
 
 	a.ui.mainView.OnPlaylistSelected(func(playlist *types.Playlist) {
@@ -297,18 +318,15 @@ func (a *App) setupSyncEventHandlers() {
 	a.core.syncManager.OnProgress(func(status string, current, total int) {
 		if total > 0 && current < total {
 			a.showLoading(true)
-			a.updateStatus(status)
 		}
 	})
 
 	a.core.syncManager.OnError(func(err error) {
-		a.updateStatus(fmt.Sprintf("Sync error: %v", err))
 		a.showLoading(false)
 		a.state.syncInProgress = false
 	})
 
 	a.core.syncManager.OnComplete(func() {
-		a.updateStatus("Sync completed")
 		a.showLoading(false)
 		a.state.syncInProgress = false
 		go func() {
@@ -384,12 +402,10 @@ func (a *App) loadInitialSongs() {
 }
 
 func (a *App) initializeAnonymous() {
-	a.updateStatus("Initializing anonymous session...")
 	go func() {
 		ctx := context.Background()
-		anonID, err := a.core.api.GetAnonymousToken(ctx)
+		anonID, err := a.core.api.EnsureAnonymousToken(ctx)
 		if err != nil {
-			a.updateStatus("Offline mode")
 			return
 		}
 		a.cfg.User.AnonymousID = anonID
@@ -420,11 +436,14 @@ func (a *App) handleAuthentication(token string) {
 			a.ui.sidebar.SetAuthenticated(true, user.Username)
 		})
 	}()
-	a.updateStatus("Authenticated successfully")
 	a.startSync()
 }
 
 func (a *App) startBackgroundTasks() {
+	if a.core.playSyncService != nil {
+		a.core.playSyncService.Start()
+	}
+
 	go func() {
 		ticker := time.NewTicker(30 * time.Second)
 		defer ticker.Stop()
@@ -456,7 +475,7 @@ func (a *App) playSong(song *types.Song, playlist []*types.Song) {
 		a.state.currentIndex = 0
 	}
 	a.ui.playerBar.SetQueue(a.state.currentQueue, a.state.currentIndex)
-	a.updateStatus(fmt.Sprintf("Playing: %s", song.Name))
+
 	if a.cfg.Download.AutoDownload && !song.Downloaded {
 		go a.core.downloadManager.DownloadSong(context.Background(), song)
 	}
@@ -464,13 +483,11 @@ func (a *App) playSong(song *types.Song, playlist []*types.Song) {
 
 func (a *App) playPlaylist(playlist *types.Playlist) {
 	if len(playlist.Songs) == 0 {
-		a.updateStatus("Playlist is empty")
 		return
 	}
 	a.state.currentQueue = playlist.Songs
 	a.state.currentIndex = 0
 	a.ui.playerBar.SetQueue(a.state.currentQueue, a.state.currentIndex)
-	a.updateStatus(fmt.Sprintf("Playing playlist: %s", playlist.Name))
 }
 
 func (a *App) startSync() {
@@ -478,7 +495,6 @@ func (a *App) startSync() {
 		return
 	}
 	a.state.syncInProgress = true
-	a.updateStatus("Starting sync...")
 	a.showLoading(true)
 	go a.core.syncManager.Start(a.ctx)
 }
@@ -497,19 +513,20 @@ func (a *App) logout() {
 	a.core.syncManager.Stop()
 	a.core.api.SetToken("")
 	a.initializeAnonymous()
-	a.updateStatus("Logged out")
 }
 
 func (a *App) updateStatus(message string) {
 	fyne.Do(func() {
 		if a.ui.statusBar != nil {
 			a.ui.statusBar.SetText(message)
+			a.ui.statusBar.Resize(fyne.NewSize(0, a.ui.statusBar.MinSize().Height/2))
 		}
 	})
 	time.AfterFunc(5*time.Second, func() {
 		fyne.Do(func() {
 			if a.ui.statusBar != nil && a.ui.statusBar.Text == message {
 				a.ui.statusBar.SetText("Ready")
+				a.ui.statusBar.Resize(fyne.NewSize(0, a.ui.statusBar.MinSize().Height/2))
 			}
 		})
 	})
@@ -558,6 +575,9 @@ func (a *App) ShowAndRun() {
 }
 
 func (a *App) Close() {
+	if a.core.playSyncService != nil {
+		a.core.playSyncService.Stop()
+	}
 	if a.core.syncManager != nil {
 		a.core.syncManager.Stop()
 	}
